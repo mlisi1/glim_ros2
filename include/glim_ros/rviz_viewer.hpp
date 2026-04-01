@@ -30,7 +30,7 @@ class TrajectoryManager;
 /**
  * @brief Rviz-based viewer
  */
-class RvizViewer : public ExtensionModuleROS2 {
+class RvizViewer : public ExtensionModuleROS2, public rclcpp::Node {
 public:
   RvizViewer();
   ~RvizViewer();
@@ -62,6 +62,8 @@ private:
   std::string map_frame_id;
   bool publish_imu2lidar;
   double tf_time_offset;
+
+  bool publish_tf = true;
 
   std::shared_ptr<rclcpp::Publisher<sensor_msgs::msg::PointCloud2>> map_pub;
 

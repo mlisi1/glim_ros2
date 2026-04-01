@@ -15,7 +15,7 @@
 
 namespace glim {
 
-RvizViewer::RvizViewer() : logger(create_module_logger("rviz")) {
+RvizViewer::RvizViewer() : logger(create_module_logger("rviz")) , rclcpp::Node("rviz_viewer") {
   const Config config(GlobalConfig::get_config_path("config_ros"));
 
   imu_frame_id = config.param<std::string>("glim_ros", "imu_frame_id", "");
@@ -29,6 +29,9 @@ RvizViewer::RvizViewer() : logger(create_module_logger("rviz")) {
   map_frame_id = config.param<std::string>("glim_ros", "map_frame_id", "map");
   publish_imu2lidar = config.param<bool>("glim_ros", "publish_imu2lidar", true);
   tf_time_offset = config.param<double>("glim_ros", "tf_time_offset", 1e-6);
+
+  this->declare_parameter<bool>("publish_tf", false);
+  publish_tf = this->get_parameter("publish_tf").as_bool();
 
   last_globalmap_pub_time = rclcpp::Clock(rcl_clock_type_t::RCL_ROS_TIME).now();
   trajectory.reset(new TrajectoryManager);
@@ -184,7 +187,6 @@ void RvizViewer::odometry_new_frame(const EstimationFrame::ConstPtr& new_frame, 
   const auto tf_stamp = from_sec(new_frame->stamp + tf_time_offset);
   const auto imu_end_stamp = from_sec(imu_end_time);
 
-  const bool publish_tf = !corrected;
   if (publish_tf) {
     // Odom -> Base
     geometry_msgs::msg::TransformStamped trans;
