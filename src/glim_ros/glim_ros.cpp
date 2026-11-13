@@ -66,6 +66,9 @@ GlimROS::GlimROS(const rclcpp::NodeOptions& options) : Node("glim_ros", options)
     spdlog::info("dump_on_unload={}", dump_on_unload);
   }
 
+  // If true, a stopped extension module (e.g., closing the viewer window) shuts the node down (upstream behavior)
+  shutdown_on_extension_exit = this->declare_parameter<bool>("shutdown_on_extension_exit", false);
+
   std::string config_path;
   this->declare_parameter<std::string>("config_path", "config");
   this->get_parameter<std::string>("config_path", config_path);
@@ -325,8 +328,17 @@ bool GlimROS::needs_wait() {
 
 void GlimROS::timer_callback() {
   for (const auto& ext_module : extension_modules) {
-    if (!ext_module->ok()) {
+    if (ext_module->ok()) {
+      continue;
+    }
+    if (shutdown_on_extension_exit) {
+      spdlog::info("an extension module requested termination; shutting down");
       rclcpp::shutdown();
+      return;
+    }
+    // e.g., a GUI viewer window was closed: keep SLAM running
+    if (exited_extension_modules.insert(ext_module.get()).second) {
+      spdlog::warn("an extension module stopped (e.g., viewer closed); SLAM keeps running (shutdown_on_extension_exit=false)");
     }
   }
 

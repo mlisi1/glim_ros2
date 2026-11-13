@@ -2,8 +2,12 @@
 
 #include <any>
 #include <atomic>
+#include <deque>
+#include <mutex>
+#include <optional>
 #include <thread>
 #include <chrono>
+#include <condition_variable>
 
 #include <rclcpp/rclcpp.hpp>
 #include <tf2_ros/buffer.h>
@@ -31,9 +35,14 @@ namespace glim {
 class TrajectoryManager;
 
 /**
- * @brief Rviz-based viewer
+ * @brief ROS2 output module (odometry, poses, TF, point clouds, map).
+ *
+ * GLIM callbacks are invoked synchronously from the estimation threads. To keep the cost of
+ * ROS publishing (message conversion, DDS serialization) out of the SLAM pipeline, the callbacks
+ * only enqueue the (immutable) estimation frames; all conversion and publishing happen in a
+ * dedicated worker thread.
  */
-class RvizViewer : public ExtensionModuleROS2, public rclcpp::Node {
+class RvizViewer : public ExtensionModuleROS2 {
 public:
   RvizViewer();
   ~RvizViewer();
@@ -41,17 +50,43 @@ public:
   virtual std::vector<GenericTopicSubscription::Ptr> create_subscriptions(rclcpp::Node& node) override;
 
 private:
+  /// Frame in which body poses/twists are expressed
+  enum class BodyFrame { IMU, LIDAR, BASE };
+
+  struct FrameTask {
+    EstimationFrame::ConstPtr frame;
+    bool corrected;
+    Eigen::Isometry3d T_world_odom;  // map -> odom snapshot taken when the frame was produced
+  };
+
   void set_callbacks();
-  void odometry_new_frame(const EstimationFrame::ConstPtr& new_frame, bool corrected);
+  void on_new_frame(const EstimationFrame::ConstPtr& new_frame, bool corrected);
+  void on_insert_imu(double stamp, const Eigen::Vector3d& angular_vel);
+  Eigen::Vector3d mean_gyro(double t0, double t1);
   void globalmap_on_update_submaps(const std::vector<SubMap::Ptr>& submaps);
   void invoke(const std::function<void()>& task);
 
-  void spin_once();
+  void worker_loop();
+  void resolve_frame_ids();
+  std::optional<Eigen::Isometry3d> lookup_T_imu_base();
+  void publish_frame(const FrameTask& task);
+
+  bool should_warn(std::chrono::steady_clock::time_point& last, double period_sec);
 
 private:
   std::atomic_bool kill_switch;
   std::thread thread;
+  std::atomic_bool initialized;
 
+  std::mutex queue_mutex;
+  std::condition_variable queue_cv;
+  std::deque<FrameTask> frame_queue;
+  std::vector<std::function<void()>> invoke_queue;
+  size_t max_frame_queue;
+  std::chrono::steady_clock::time_point last_drop_warn;
+  std::chrono::steady_clock::time_point last_scanend_warn;
+
+  rclcpp::Clock::SharedPtr clock;
   std::unique_ptr<tf2_ros::Buffer> tf_buffer;
   std::unique_ptr<tf2_ros::TransformListener> tf_listener;
   std::unique_ptr<tf2_ros::TransformBroadcaster> tf_broadcaster;
@@ -63,10 +98,23 @@ private:
   std::string base_frame_id;
   std::string odom_frame_id;
   std::string map_frame_id;
-  bool publish_imu2lidar;
+  bool frame_ids_resolved;
   double tf_time_offset;
 
-  bool publish_tf = true;
+  // TF switches (ROS parameters on the glim_ros node)
+  bool publish_tf_map_odom;
+  bool publish_tf_odom_base;
+  bool publish_tf_imu_lidar;
+
+  // Odometry/pose output frame
+  BodyFrame odom_child_frame;
+  double twist_angular_cov;     // variance [rad^2/s^2] reported for angular velocity
+  double twist_angular_window;  // gyro averaging window [s] centered on the frame stamp
+
+  // Recent gyro samples [t, wx, wy, wz] (angular velocity source for the odometry twist)
+  std::mutex imu_mutex;
+  std::deque<Eigen::Vector4d> gyro_buffer;
+  std::optional<Eigen::Isometry3d> T_imu_base;  // cached static transform
 
   std::shared_ptr<rclcpp::Publisher<sensor_msgs::msg::PointCloud2>> map_pub;
 
@@ -106,9 +154,6 @@ private:
   std::unique_ptr<TrajectoryManager> trajectory;
 
   std::vector<gtsam_points::PointCloud::ConstPtr> submaps;
-
-  std::mutex invoke_queue_mutex;
-  std::vector<std::function<void()>> invoke_queue;
 
   // Logging
   std::shared_ptr<spdlog::logger> logger;

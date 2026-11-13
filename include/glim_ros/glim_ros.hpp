@@ -3,6 +3,7 @@
 #include <any>
 #include <deque>
 #include <memory>
+#include <unordered_set>
 #include <rclcpp/rclcpp.hpp>
 
 #include <sensor_msgs/msg/imu.hpp>
@@ -55,6 +56,8 @@ private:
   double acc_scale;
   double ang_scale;
   bool dump_on_unload;
+  bool shutdown_on_extension_exit;
+  std::unordered_set<const ExtensionModule*> exited_extension_modules;
 
   std::string intensity_field, ring_field;
 
