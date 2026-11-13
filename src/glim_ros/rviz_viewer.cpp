@@ -1,6 +1,12 @@
 #include <glim_ros/rviz_viewer.hpp>
 
 #include <mutex>
+#include <ctime>
+#include <fstream>
+#include <iomanip>
+#include <filesystem>
+#include <unordered_map>
+#include <unordered_set>
 #include <set>
 #include <spdlog/spdlog.h>
 #include <rclcpp/clock.hpp>
@@ -193,6 +199,17 @@ RvizViewer::RvizViewer() : logger(create_module_logger("rviz")) {
   map_odom_tolerance = 0.1;
   external_odom_timeout = 0.1;
 
+  map_voxel_size = 0.2;
+  map_publish_period = 10.0;
+  grid_resolution = 0.1;
+  grid_z_min = 0.3;
+  grid_z_max = 1.5;
+  grid_min_points = 3;
+  grid_ground_cell = 1.0;
+  grid_max_range = 30.0;
+  map_dirty = grid_dirty = false;
+  last_map_subs = last_grid_subs = 0;
+
   trajectory.reset(new TrajectoryManager);
 
   set_callbacks();
@@ -200,12 +217,15 @@ RvizViewer::RvizViewer() : logger(create_module_logger("rviz")) {
   initialized = false;
   kill_switch = false;
   thread = std::thread([this] { worker_loop(); });
+  map_thread = std::thread([this] { map_loop(); });
 }
 
 RvizViewer::~RvizViewer() {
   kill_switch = true;
   queue_cv.notify_all();
+  map_task_cv.notify_all();
   thread.join();
+  map_thread.join();
 }
 
 std::vector<GenericTopicSubscription::Ptr> RvizViewer::create_subscriptions(rclcpp::Node& node) {
@@ -260,6 +280,15 @@ std::vector<GenericTopicSubscription::Ptr> RvizViewer::create_subscriptions(rclc
     publish_tf_imu_lidar,
     child);
 
+  map_voxel_size = node.declare_parameter<double>("map_voxel_size", map_voxel_size);
+  map_publish_period = node.declare_parameter<double>("map_publish_period", map_publish_period);
+  grid_resolution = node.declare_parameter<double>("grid_resolution", grid_resolution);
+  grid_z_min = node.declare_parameter<double>("grid_z_min", grid_z_min);
+  grid_z_max = node.declare_parameter<double>("grid_z_max", grid_z_max);
+  grid_min_points = node.declare_parameter<int>("grid_min_points", grid_min_points);
+  grid_max_range = node.declare_parameter<double>("grid_max_range", grid_max_range);
+  grid_ground_cell = node.declare_parameter<double>("grid_ground_cell", grid_ground_cell);
+
   // --- Outputs ---
   const auto outputs_param = node.declare_parameter<std::vector<std::string>>("outputs", std::vector<std::string>{"all"});
   const std::set<std::string> outputs(outputs_param.begin(), outputs_param.end());
@@ -291,6 +320,7 @@ std::vector<GenericTopicSubscription::Ptr> RvizViewer::create_subscriptions(rclc
   create(odometry_global_pub, "odometry/global", qos);
 
   create(map_pub, "map", map_qos);
+  create(grid_pub, "grid", map_qos);
 
   create(points_pub, "points", qos);
   create(points_corrected_pub, "points_corrected", qos);
@@ -332,6 +362,7 @@ std::vector<GenericTopicSubscription::Ptr> RvizViewer::create_subscriptions(rclc
 
   last_globalmap_pub_time = clock->now();
   last_map_odom_pub = clock->now();
+  last_grid_pub_time = clock->now();
 
   initialized = true;
   queue_cv.notify_all();
@@ -417,12 +448,11 @@ void RvizViewer::on_new_frame(const EstimationFrame::ConstPtr& new_frame, bool c
 void RvizViewer::worker_loop() {
   while (!kill_switch) {
     std::deque<FrameTask> frames;
-    std::vector<std::function<void()>> tasks;
     {
       std::unique_lock<std::mutex> lock(queue_mutex);
       const double wait_sec = map_odom_external ? std::min(0.1, 0.5 / std::max(map_odom_rate, 1.0)) : 0.1;
       queue_cv.wait_for(lock, std::chrono::duration<double>(wait_sec), [this] {
-        return kill_switch || (initialized && (!frame_queue.empty() || !invoke_queue.empty()));
+        return kill_switch || (initialized && !frame_queue.empty());
       });
       if (kill_switch) {
         break;
@@ -431,12 +461,8 @@ void RvizViewer::worker_loop() {
         continue;
       }
       frames.swap(frame_queue);
-      tasks.swap(invoke_queue);
     }
 
-    for (const auto& task : tasks) {
-      task();
-    }
     for (const auto& frame : frames) {
       publish_frame(frame);
     }
@@ -497,9 +523,13 @@ void RvizViewer::resolve_frame_ids() {
 }
 
 std::optional<Eigen::Isometry3d> RvizViewer::lookup_T_imu_base() {
+  if (!frame_ids_resolved) {
+    return std::nullopt;
+  }
   if (base_frame_id == imu_frame_id) {
     return Eigen::Isometry3d::Identity();
   }
+  std::lock_guard<std::mutex> lock(T_imu_base_mutex);
   if (T_imu_base) {
     return T_imu_base;
   }
@@ -831,62 +861,287 @@ void RvizViewer::globalmap_on_update_submaps(const std::vector<SubMap::Ptr>& sub
     trajectory->update_anchor(stamp_endpoint_R, T_world_endpoint_R);
   }
 
-  std::vector<Eigen::Isometry3d, Eigen::aligned_allocator<Eigen::Isometry3d>> submap_poses(submaps.size());
-  for (int i = 0; i < submaps.size(); i++) {
-    submap_poses[i] = submaps[i]->T_world_origin;
+  std::vector<SubMap::ConstPtr> all(submaps.begin(), submaps.end());
+  std::vector<Eigen::Isometry3d, Eigen::aligned_allocator<Eigen::Isometry3d>> poses(submaps.size());
+  for (size_t i = 0; i < submaps.size(); i++) {
+    poses[i] = submaps[i]->T_world_origin;
   }
 
-  // Invoke a submap concatenation task in the worker thread
-  invoke([this, latest_submap, submap_poses] {
-    // on_update_submaps also fires from GlobalMapping::optimize(), which runs periodically while
-    // the input queues are idle and adds no submap. Only append when a submap was actually added.
-    if (this->submaps.size() < submap_poses.size()) {
-      this->submaps.push_back(latest_submap->frame);
+  // Cache new submaps (downsampled) and the updated poses in the map thread.
+  // on_update_submaps also fires from GlobalMapping::optimize() without new submaps: then only poses change.
+  invoke([this, all, poses] {
+    std::vector<SubmapCache> new_caches;
+    size_t num_cached;
+    {
+      std::lock_guard<std::mutex> lock(map_mutex);
+      num_cached = submap_caches.size();
+    }
+    for (size_t i = num_cached; i < all.size(); i++) {
+      new_caches.push_back(make_submap_cache(all[i]));
     }
 
-    if (!has_subs(map_pub)) {
-      return;
-    }
-
-    // Publish global map every 10 seconds
-    const rclcpp::Time now = clock->now();
-    if (now - last_globalmap_pub_time < std::chrono::seconds(10)) {
-      return;
-    }
-    last_globalmap_pub_time = now;
-
-    logger->warn("Publishing global map is computationally demanding and not recommended");
-
-    const size_t num_submaps = std::min(this->submaps.size(), submap_poses.size());
-    size_t total_num_points = 0;
-    for (size_t i = 0; i < num_submaps; i++) {
-      total_num_points += this->submaps[i]->size();
-    }
-
-    // Concatenate all the submap points
-    gtsam_points::PointCloudCPU::Ptr merged(new gtsam_points::PointCloudCPU);
-    merged->num_points = total_num_points;
-    merged->points_storage.resize(total_num_points);
-    merged->points = merged->points_storage.data();
-
-    size_t begin = 0;
-    for (size_t i = 0; i < num_submaps; i++) {
-      const auto& submap = this->submaps[i];
-      std::transform(submap->points, submap->points + submap->size(), merged->points + begin, [&](const Eigen::Vector4d& p) { return submap_poses[i] * p; });
-      begin += submap->size();
-    }
-
-    auto points_msg = frame_to_pointcloud2(map_frame_id, now.seconds(), *merged);
-    map_pub->publish(*points_msg);
+    std::lock_guard<std::mutex> lock(map_mutex);
+    submap_caches.insert(submap_caches.end(), new_caches.begin(), new_caches.end());
+    submap_poses = poses;
+    map_dirty = grid_dirty = true;
   });
 }
 
 void RvizViewer::invoke(const std::function<void()>& task) {
   {
-    std::lock_guard<std::mutex> lock(queue_mutex);
+    std::lock_guard<std::mutex> lock(map_task_mutex);
     invoke_queue.push_back(task);
   }
-  queue_cv.notify_one();
+  map_task_cv.notify_one();
+}
+
+void RvizViewer::map_loop() {
+  while (!kill_switch) {
+    std::vector<std::function<void()>> tasks;
+    {
+      std::unique_lock<std::mutex> lock(map_task_mutex);
+      map_task_cv.wait_for(lock, std::chrono::milliseconds(500), [this] { return kill_switch || !invoke_queue.empty(); });
+      if (kill_switch) {
+        break;
+      }
+      tasks.swap(invoke_queue);
+    }
+
+    for (const auto& task : tasks) {
+      task();
+    }
+
+    if (initialized) {
+      publish_map_and_grid();
+    }
+  }
+}
+
+RvizViewer::SubmapCache RvizViewer::make_submap_cache(const SubMap::ConstPtr& submap) {
+  SubmapCache cache;
+  cache.points = gtsam_points::voxelgrid_sampling(submap->frame, map_voxel_size);
+
+  const auto grid_points = gtsam_points::voxelgrid_sampling(submap->frame, grid_resolution);
+  cache.grid_points.reserve(grid_points->size());
+  for (size_t i = 0; i < grid_points->size(); i++) {
+    cache.grid_points.push_back(grid_points->points[i].head<3>());
+  }
+  return cache;
+}
+
+// Requires map_mutex
+gtsam_points::PointCloudCPU::Ptr RvizViewer::build_map() {
+  const size_t n = std::min(submap_caches.size(), submap_poses.size());
+  size_t total = 0;
+  for (size_t i = 0; i < n; i++) {
+    total += submap_caches[i].points->size();
+  }
+
+  std::vector<Eigen::Vector4d> points;
+  points.reserve(total);
+  for (size_t i = 0; i < n; i++) {
+    const auto& cloud = submap_caches[i].points;
+    for (size_t j = 0; j < cloud->size(); j++) {
+      points.push_back(submap_poses[i] * cloud->points[j]);
+    }
+  }
+
+  auto merged = std::make_shared<gtsam_points::PointCloudCPU>(points);
+  // Remove the overlap between submaps
+  return gtsam_points::voxelgrid_sampling(merged, map_voxel_size, 2);
+}
+
+// Requires map_mutex
+std::shared_ptr<nav_msgs::msg::OccupancyGrid> RvizViewer::build_grid() {
+  const size_t n = std::min(submap_caches.size(), submap_poses.size());
+  if (n == 0) {
+    return nullptr;
+  }
+
+  // Bounds
+  Eigen::Vector2d min_pt = Eigen::Vector2d::Constant(std::numeric_limits<double>::max());
+  Eigen::Vector2d max_pt = -min_pt;
+  const auto extend = [&](const Eigen::Vector3d& p) {
+    min_pt = min_pt.cwiseMin(p.head<2>());
+    max_pt = max_pt.cwiseMax(p.head<2>());
+  };
+  for (size_t i = 0; i < n; i++) {
+    const Eigen::Vector3d o = submap_poses[i].translation();
+    extend(o);
+    for (const auto& p : submap_caches[i].grid_points) {
+      const Eigen::Vector3d w = submap_poses[i] * p;
+      if ((w - o).head<2>().norm() <= grid_max_range) extend(w);
+    }
+  }
+  min_pt -= Eigen::Vector2d::Constant(2 * grid_resolution);
+  max_pt += Eigen::Vector2d::Constant(2 * grid_resolution);
+
+  const int W = static_cast<int>(std::ceil((max_pt.x() - min_pt.x()) / grid_resolution));
+  const int H = static_cast<int>(std::ceil((max_pt.y() - min_pt.y()) / grid_resolution));
+  if (static_cast<size_t>(W) * H > 50'000'000) {
+    logger->warn("occupancy grid too large ({}x{} cells); increase grid_resolution", W, H);
+    return nullptr;
+  }
+
+  std::vector<uint16_t> hits(static_cast<size_t>(W) * H, 0);
+  std::vector<uint16_t> passes(static_cast<size_t>(W) * H, 0);
+  const auto to_cell = [&](const Eigen::Vector3d& w) {
+    return Eigen::Vector2i(static_cast<int>((w.x() - min_pt.x()) / grid_resolution), static_cast<int>((w.y() - min_pt.y()) / grid_resolution));
+  };
+  const auto inside = [&](const Eigen::Vector2i& c) { return c.x() >= 0 && c.y() >= 0 && c.x() < W && c.y() < H; };
+  const auto sat_inc = [](uint16_t& v) { v = v < std::numeric_limits<uint16_t>::max() ? v + 1 : v; };
+
+  // Bresenham ray from a to b: marks passes, excluding b
+  const auto raycast = [&](const Eigen::Vector2i& a, const Eigen::Vector2i& b) {
+    int x0 = a.x(), y0 = a.y();
+    const int dx = std::abs(b.x() - x0), dy = -std::abs(b.y() - y0);
+    const int sx = x0 < b.x() ? 1 : -1, sy = y0 < b.y() ? 1 : -1;
+    int err = dx + dy;
+    while (x0 != b.x() || y0 != b.y()) {
+      sat_inc(passes[static_cast<size_t>(y0) * W + x0]);
+      const int e2 = 2 * err;
+      if (e2 >= dy) {
+        err += dy;
+        x0 += sx;
+      }
+      if (e2 <= dx) {
+        err += dx;
+        y0 += sy;
+      }
+    }
+  };
+
+  for (size_t i = 0; i < n; i++) {
+    const Eigen::Vector3d o = submap_poses[i].translation();
+    const Eigen::Vector2i oc = to_cell(o);
+    if (!inside(oc)) continue;
+
+    // Local ground: lowest point of THIS submap in each grid_ground_cell column. Estimated per submap because
+    // overlapping submaps can be vertically offset by more than the obstacle band (robust to slopes too).
+    std::vector<Eigen::Vector3d> pts;
+    pts.reserve(submap_caches[i].grid_points.size());
+    std::unordered_map<int64_t, float> ground;
+    const auto ground_key = [&](const Eigen::Vector3d& w) {
+      return (static_cast<int64_t>(std::floor(w.y() / grid_ground_cell)) << 32) ^ (static_cast<int64_t>(std::floor(w.x() / grid_ground_cell)) & 0xffffffff);
+    };
+    for (const auto& p : submap_caches[i].grid_points) {
+      const Eigen::Vector3d w = submap_poses[i] * p;
+      if ((w - o).head<2>().norm() > grid_max_range || !inside(to_cell(w))) continue;
+      pts.push_back(w);
+      auto found = ground.try_emplace(ground_key(w), static_cast<float>(w.z()));
+      found.first->second = std::min(found.first->second, static_cast<float>(w.z()));
+    }
+
+    std::unordered_map<int64_t, int> obstacle_cells;  // cell -> number of voxels in the band
+    std::unordered_set<int64_t> free_cells;
+    for (const auto& w : pts) {
+      const Eigen::Vector2i c = to_cell(w);
+      const double h = w.z() - ground[ground_key(w)];
+      const int64_t idx = static_cast<int64_t>(c.y()) * W + c.x();
+      if (h >= grid_z_min && h <= grid_z_max) {
+        obstacle_cells[idx]++;
+      } else if (h < grid_z_min) {
+        free_cells.insert(idx);  // ground: observed traversable surface
+      }
+    }
+
+    for (const auto& [idx, count] : obstacle_cells) {
+      raycast(oc, Eigen::Vector2i(idx % W, idx / W));
+      for (int k = 0; k < count; k++) sat_inc(hits[idx]);
+    }
+    for (const auto idx : free_cells) {
+      raycast(oc, Eigen::Vector2i(idx % W, idx / W));
+      sat_inc(passes[idx]);
+    }
+  }
+
+  auto grid = std::make_shared<nav_msgs::msg::OccupancyGrid>();
+  grid->header.frame_id = map_frame_id;
+  grid->header.stamp = clock->now();
+  grid->info.map_load_time = grid->header.stamp;
+  grid->info.resolution = grid_resolution;
+  grid->info.width = W;
+  grid->info.height = H;
+  grid->info.origin.position.x = min_pt.x();
+  grid->info.origin.position.y = min_pt.y();
+  grid->info.origin.orientation.w = 1.0;
+  grid->data.resize(static_cast<size_t>(W) * H);
+  for (size_t k = 0; k < grid->data.size(); k++) {
+    grid->data[k] = hits[k] >= grid_min_points ? 100 : (passes[k] > 0 || hits[k] > 0 ? 0 : -1);
+  }
+  return grid;
+}
+
+void RvizViewer::publish_map_and_grid() {
+  std::lock_guard<std::mutex> lock(map_mutex);
+  if (submap_caches.empty()) {
+    return;
+  }
+  const rclcpp::Time now = clock->now();
+
+  // Publish when changed (at most every map_publish_period) or when a new subscriber appears
+  const size_t map_subs = map_pub ? map_pub->get_subscription_count() : 0;
+  if (map_subs && ((map_dirty && (now - last_globalmap_pub_time).seconds() >= map_publish_period) || map_subs > last_map_subs)) {
+    auto map = build_map();
+    map_pub->publish(*frame_to_pointcloud2(map_frame_id, now.seconds(), *map));
+    last_globalmap_pub_time = now;
+    map_dirty = false;
+    logger->debug("published map ({} points)", map->size());
+  }
+  last_map_subs = map_subs;
+
+  const size_t grid_subs = grid_pub ? grid_pub->get_subscription_count() : 0;
+  if (grid_subs && ((grid_dirty && (now - last_grid_pub_time).seconds() >= map_publish_period) || grid_subs > last_grid_subs)) {
+    auto grid = build_grid();
+    if (grid) {
+      grid_pub->publish(*grid);
+      logger->debug("published grid ({}x{})", grid->info.width, grid->info.height);
+    }
+    last_grid_pub_time = now;
+    grid_dirty = false;
+  }
+  last_grid_subs = grid_subs;
+}
+
+void RvizViewer::at_exit(const std::string& dump_path) {
+  std::lock_guard<std::mutex> lock(map_mutex);
+  if (submap_caches.empty() || !clock) {
+    return;
+  }
+  std::filesystem::create_directories(dump_path);
+
+  // Point cloud map (binary PCD)
+  const auto map = build_map();
+  {
+    std::ofstream ofs(dump_path + "/map.pcd", std::ios::binary);
+    ofs << "# .PCD v0.7 - Point Cloud Data file format\nVERSION 0.7\nFIELDS x y z\nSIZE 4 4 4\nTYPE F F F\nCOUNT 1 1 1\n"
+        << "WIDTH " << map->size() << "\nHEIGHT 1\nVIEWPOINT 0 0 0 1 0 0 0\nPOINTS " << map->size() << "\nDATA binary\n";
+    for (size_t i = 0; i < map->size(); i++) {
+      const Eigen::Vector3f p = map->points[i].head<3>().cast<float>();
+      ofs.write(reinterpret_cast<const char*>(p.data()), sizeof(float) * 3);
+    }
+  }
+  logger->info("saved {} ({} points)", dump_path + "/map.pcd", map->size());
+
+  // Occupancy grid (nav2_map_server trinary format)
+  const auto grid = build_grid();
+  if (grid) {
+    const int W = grid->info.width, H = grid->info.height;
+    std::ofstream pgm(dump_path + "/map.pgm", std::ios::binary);
+    pgm << "P5\n# glim_ros occupancy grid\n" << W << " " << H << "\n255\n";
+    for (int y = H - 1; y >= 0; y--) {  // image rows go from top (max y) to bottom
+      for (int x = 0; x < W; x++) {
+        const int8_t v = grid->data[static_cast<size_t>(y) * W + x];
+        const uint8_t px = v < 0 ? 205 : (v >= 50 ? 0 : 254);
+        pgm.put(static_cast<char>(px));
+      }
+    }
+
+    std::ofstream yaml(dump_path + "/map.yaml");
+    yaml << std::setprecision(9) << "image: map.pgm\nmode: trinary\nresolution: " << grid->info.resolution << "\norigin: [" << grid->info.origin.position.x << ", "
+         << grid->info.origin.position.y << ", 0.0]\nnegate: 0\noccupied_thresh: 0.65\nfree_thresh: 0.25\n";
+    logger->info("saved {} ({}x{} cells)", dump_path + "/map.yaml", W, H);
+  }
 }
 
 }  // namespace glim

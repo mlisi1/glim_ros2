@@ -22,6 +22,9 @@ files keep working. The work happens on the `dev` branch.
 | Topic naming | `odom_corrected` means "optimized", not "loop-closure corrected" | Added `~/odometry/local` and `~/odometry/global` with explicit semantics |
 | Viewer | Closing a viewer window shuts the whole node down | SLAM keeps running (`shutdown_on_extension_exit`) |
 | Clouds | `aligned_points` in GLIM's odom frame but labelled `map` | Transformed into `map` |
+| Map | Full-resolution concatenation of all submaps every 10 s, built in the publishing thread | Per-submap voxelized cache, rebuilt with the current (loop-closed) poses only when changed, in its own thread |
+| Navigation map | None | `~/grid` 2D occupancy grid (`nav_msgs/OccupancyGrid`) |
+| Saving | Only at shutdown, to `/tmp/dump` | `~/save_map` service at any time: GLIM dump + `map.pcd` + `map.pgm`/`map.yaml` (nav2_map_server) |
 
 ## How it works
 
@@ -35,7 +38,11 @@ files keep working. The work happens on the `dev` branch.
                     │  callback side (estimation threads): enqueue frame + map->odom snapshot, buffer gyro
                     │  worker thread: build messages, transform frames/covariances, publish, broadcast TF
                     ▼
-                 ~/odometry/*, ~/odom*, ~/pose*, ~/points*, ~/map, TF
+                 ~/odometry/*, ~/odom*, ~/pose*, ~/points*, TF
+                    │
+                    │  map thread: cache each new submap (voxelized), keep the latest submap poses,
+                    ▼  rebuild ~/map and ~/grid when changed (low priority, never blocks odometry/TF)
+                 ~/map, ~/grid, map.pcd / map.pgm / map.yaml on save
 ```
 
 * **GlimROS** (`src/glim_ros/glim_ros.cpp`) subscribes to IMU / point cloud (/ image) topics, feeds GLIM
@@ -50,6 +57,22 @@ files keep working. The work happens on the `dev` branch.
   optimized one (`on_update_new_frame`). Topics without the `_corrected` suffix carry the prediction,
   `_corrected` topics and TF carry the optimized estimate. Neither includes loop closures; those are
   applied through `map->odom` (`T_world_odom`, updated when the global map is optimized).
+
+### Map and occupancy grid
+
+* Each new submap is downsampled once (`map_voxel_size` for the cloud, `grid_resolution` for the grid)
+  and cached in its own frame; maps are assembled with the current submap poses, so loop closures are
+  reflected. Map and grid are rebuilt at most every `map_publish_period`, only when they changed and
+  someone is subscribed (or a new subscriber appears; both topics are latched).
+* Grid: for every submap, the local ground is the lowest point of that submap in each
+  `grid_ground_cell` column (per submap, because overlapping submaps can be vertically offset by more
+  than the obstacle band). Points `grid_z_min`..`grid_z_max` above the local ground are obstacles
+  (a cell needs `grid_min_points` of them); lower points are ground. Free space is carved by rays from
+  the submap origin to every observed cell (up to `grid_max_range`). Unobserved cells are unknown.
+  The grid is a static map for localization/planning; Nav2 costmaps should still use live sensor data.
+* `~/save_map` (`std_srvs/Trigger`) saves to `map_save_directory/<YYYYmmdd_HHMMSS>/` in a background
+  thread and returns the path immediately. The same files are written to `dump_path` at shutdown.
+  The dump can be opened with `offline_viewer`; `map.yaml` loads in `nav2_map_server`.
 
 ### Frames
 
@@ -95,6 +118,14 @@ false in this mode. `map_odom_planar:=true` keeps only x, y, yaw (useful with a 
 | `outputs` | `["all"]` | Topics to create (names below, without `~/`) |
 | `max_publish_queue` | `64` | Frames buffered for publishing before dropping the oldest |
 | `shutdown_on_extension_exit` | `false` | Upstream behavior: shut down when a viewer window is closed |
+| `map_save_directory` | `/tmp/glim_maps` | Where `~/save_map` writes (`~` expanded) |
+| `map_voxel_size` | `0.2` | [m] voxel size of `~/map` and `map.pcd` |
+| `map_publish_period` | `10.0` | [s] minimum period between `~/map` / `~/grid` rebuilds |
+| `grid_resolution` | `0.1` | [m] occupancy grid cell size |
+| `grid_z_min`, `grid_z_max` | `0.3`, `1.5` | [m] obstacle band above the local ground |
+| `grid_min_points` | `3` | Points in the band (at grid resolution) for a cell to be occupied |
+| `grid_ground_cell` | `1.0` | [m] column size for the local ground estimate |
+| `grid_max_range` | `30.0` | [m] maximum range used for obstacles and free-space carving |
 | `debug`, `dump_on_unload`, `dump_path` | | As upstream |
 
 Sensor topics, frame IDs, QoS and GLIM modules are still configured in `config_ros.json` /
@@ -117,7 +148,13 @@ Publishing is lazy: a message is only built when the topic has subscribers.
 | `imu_bias`, `imu_bias_with_cov` | `Twist(WithCovariance)Stamped` | imu | [acc bias; gyro bias] |
 | `points`, `points_corrected` | `PointCloud2` | sensor | Preprocessed scan |
 | `aligned_points`, `aligned_points_corrected` | `PointCloud2` | `map` | Scan in the map frame |
-| `map` | `PointCloud2` (latched) | `map` | Whole map, every 10 s while subscribed (expensive) |
+| `map` | `PointCloud2` (latched) | `map` | Voxelized map, rebuilt when changed (see above) |
+| `grid` | `nav_msgs/OccupancyGrid` (latched) | `map` | 2D occupancy grid |
+
+Service: `save_map` (`std_srvs/Trigger`) — response `message` is the output directory.
+
+Saving at shutdown happens after Ctrl-C and can take a few seconds on large maps; increase the launch
+`sigterm_timeout` (default 5 s) or call `save_map` before stopping.
 
 ## Example: GLIM + robot_localization + Nav2
 
@@ -129,7 +166,8 @@ Node(
         'map_odom_mode': 'external',      # EKF owns odom -> base_link, GLIM owns map -> odom
         'map_odom_planar': True,          # 2D EKF / Nav2
         'odom_child_frame': 'base',       # odometry expressed in base_link
-        'outputs': ['odometry/local', 'odometry/global', 'odom_corrected'],
+        'outputs': ['odometry/local', 'odometry/global', 'grid'],
+        'map_save_directory': '~/glim_maps',
     }],
 )
 ```

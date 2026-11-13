@@ -4,8 +4,11 @@
 #include <deque>
 #include <memory>
 #include <unordered_set>
+#include <atomic>
+#include <thread>
 #include <rclcpp/rclcpp.hpp>
 
+#include <std_srvs/srv/trigger.hpp>
 #include <sensor_msgs/msg/imu.hpp>
 #include <sensor_msgs/msg/point_cloud2.hpp>
 #ifdef BUILD_WITH_CV_BRIDGE
@@ -67,6 +70,12 @@ private:
 
   // ROS-related
   rclcpp::TimerBase::SharedPtr timer;
+
+  // ~/save_map: saves GLIM dump + map.pcd + map.pgm/yaml in the background
+  std::string map_save_directory;
+  std::atomic_bool saving;
+  std::thread save_thread;
+  rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr save_map_srv;
   rclcpp::Subscription<sensor_msgs::msg::Imu>::SharedPtr imu_sub;
   rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr points_sub;
 #ifdef BUILD_WITH_CV_BRIDGE

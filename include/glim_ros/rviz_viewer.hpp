@@ -21,6 +21,7 @@
 #endif
 
 #include <nav_msgs/msg/odometry.hpp>
+#include <nav_msgs/msg/occupancy_grid.hpp>
 #include <geometry_msgs/msg/pose_stamped.hpp>
 #include <geometry_msgs/msg/pose_with_covariance_stamped.hpp>
 #include <geometry_msgs/msg/twist_stamped.hpp>
@@ -31,6 +32,7 @@
 #include <glim/mapping/sub_map.hpp>
 #include <glim/util/extension_module.hpp>
 #include <glim/util/extension_module_ros2.hpp>
+#include <gtsam_points/types/point_cloud_cpu.hpp>
 
 namespace spdlog {
 class logger;
@@ -55,6 +57,9 @@ public:
 
   virtual std::vector<GenericTopicSubscription::Ptr> create_subscriptions(rclcpp::Node& node) override;
 
+  /// Called by GlimROS::save(): writes map.pcd and map.pgm/map.yaml (nav2_map_server format) into dump_path
+  virtual void at_exit(const std::string& dump_path) override;
+
 private:
   /// Frame in which body poses/twists are expressed
   enum class BodyFrame { IMU, LIDAR, BASE };
@@ -71,6 +76,17 @@ private:
   Eigen::Vector3d mean_gyro(double t0, double t1);
   void globalmap_on_update_submaps(const std::vector<SubMap::Ptr>& submaps);
   void invoke(const std::function<void()>& task);
+
+  // Map / grid (run in map_thread, guarded by map_mutex)
+  struct SubmapCache {
+    gtsam_points::PointCloud::ConstPtr points;      // voxelized map points (submap origin frame)
+    std::vector<Eigen::Vector3d> grid_points;       // grid-resolution points (origin frame) for the occupancy grid
+  };
+  void map_loop();
+  SubmapCache make_submap_cache(const SubMap::ConstPtr& submap);
+  gtsam_points::PointCloudCPU::Ptr build_map();
+  std::shared_ptr<nav_msgs::msg::OccupancyGrid> build_grid();
+  void publish_map_and_grid();
 
   void worker_loop();
   void resolve_frame_ids();
@@ -105,7 +121,7 @@ private:
   std::string base_frame_id;
   std::string odom_frame_id;
   std::string map_frame_id;
-  bool frame_ids_resolved;
+  std::atomic_bool frame_ids_resolved;
   double tf_time_offset;
 
   // TF switches (ROS parameters on the glim_ros node)
@@ -132,6 +148,7 @@ private:
   // Recent gyro samples [t, wx, wy, wz] (angular velocity source for the odometry twist)
   std::mutex imu_mutex;
   std::deque<Eigen::Vector4d> gyro_buffer;
+  std::mutex T_imu_base_mutex;
   std::optional<Eigen::Isometry3d> T_imu_base;  // cached static transform
 
   // Publishers: nullptr if disabled through the 'outputs' parameter
@@ -175,7 +192,29 @@ private:
   std::mutex trajectory_mutex;
   std::unique_ptr<TrajectoryManager> trajectory;
 
-  std::vector<gtsam_points::PointCloud::ConstPtr> submaps;
+  // Map data
+  std::thread map_thread;
+  std::mutex map_task_mutex;
+  std::condition_variable map_task_cv;
+  std::mutex map_mutex;
+  std::vector<SubmapCache> submap_caches;
+  std::vector<Eigen::Isometry3d, Eigen::aligned_allocator<Eigen::Isometry3d>> submap_poses;
+  bool map_dirty;
+  bool grid_dirty;
+  size_t last_map_subs;
+  size_t last_grid_subs;
+  rclcpp::Time last_grid_pub_time;
+
+  double map_voxel_size;      // [m] map downsampling
+  double map_publish_period;  // [s] min period between map/grid publications
+  double grid_resolution;     // [m/cell]
+  double grid_z_min;          // [m] obstacle band, height above the local ground
+  double grid_z_max;
+  double grid_ground_cell;    // [m] size of the columns used to estimate the local ground height
+  int grid_min_points;        // points in the band for a cell to be occupied
+  double grid_max_range;      // [m] max ray length for free-space carving
+
+  std::shared_ptr<rclcpp::Publisher<nav_msgs::msg::OccupancyGrid>> grid_pub;
 
   // Logging
   std::shared_ptr<spdlog::logger> logger;

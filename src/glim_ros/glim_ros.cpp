@@ -3,6 +3,9 @@
 #define GLIM_ROS2
 
 #include <deque>
+#include <ctime>
+#include <iomanip>
+#include <sstream>
 #include <thread>
 #include <iostream>
 #include <functional>
@@ -201,6 +204,40 @@ GlimROS::GlimROS(const rclcpp::NodeOptions& options) : Node("glim_ros", options)
     sub->create_subscriber(*this);
   }
 
+  // Map saving service
+  saving = false;
+  map_save_directory = this->declare_parameter<std::string>("map_save_directory", "/tmp/glim_maps");
+  if (!map_save_directory.empty() && map_save_directory[0] == '~' && std::getenv("HOME")) {
+    map_save_directory = std::string(std::getenv("HOME")) + map_save_directory.substr(1);
+  }
+  save_map_srv = this->create_service<std_srvs::srv::Trigger>(
+    "~/save_map",
+    [this](const std::shared_ptr<std_srvs::srv::Trigger::Request>, std::shared_ptr<std_srvs::srv::Trigger::Response> res) {
+      if (saving.exchange(true)) {
+        res->success = false;
+        res->message = "a save is already in progress";
+        return;
+      }
+
+      const std::time_t t = std::time(nullptr);
+      std::ostringstream oss;
+      oss << map_save_directory << "/" << std::put_time(std::localtime(&t), "%Y%m%d_%H%M%S");
+      const std::string path = oss.str();
+
+      // Saving optimizes and serializes the whole graph: never do it in the executor thread (it would stall sensor callbacks)
+      if (save_thread.joinable()) {
+        save_thread.join();
+      }
+      save_thread = std::thread([this, path] {
+        save(path);
+        spdlog::info("map saved to {}", path);
+        saving = false;
+      });
+
+      res->success = true;
+      res->message = path;
+    });
+
   // Start timer
   timer = this->create_wall_timer(std::chrono::milliseconds(1), [this]() { timer_callback(); });
 
@@ -209,6 +246,9 @@ GlimROS::GlimROS(const rclcpp::NodeOptions& options) : Node("glim_ros", options)
 
 GlimROS::~GlimROS() {
   spdlog::debug("quit");
+  if (save_thread.joinable()) {
+    save_thread.join();
+  }
   extension_modules.clear();
 
   if (dump_on_unload) {
