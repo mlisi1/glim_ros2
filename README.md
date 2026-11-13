@@ -39,13 +39,13 @@ files keep working. The work happens on the `dev` branch.
                     │  GLIM callbacks (on_insert_imu, on_new_frame, on_update_new_frame, on_update_submaps)
                     ▼
                  ROS output module (librviz_viewer.so, loaded as a GLIM extension module)
-                    │  callback side (estimation threads): enqueue frame + map->odom snapshot, buffer gyro
+                    │  callback side (estimation threads): enqueue frame + map->odom snapshot, buffer IMU
                     │  worker thread: build messages, transform frames/covariances, publish, broadcast TF
                     ▼
                  ~/odometry/*, ~/odom*, ~/pose*, ~/points*, TF
                     │
                     │  map thread: cache each new submap (voxelized), keep the latest submap poses,
-                    ▼  rebuild ~/map and ~/grid when changed (low priority, never blocks odometry/TF)
+                    ▼  rebuild ~/map and ~/grid when changed (separate thread, never blocks odometry/TF)
                  ~/map, ~/grid, map.pcd / map.pgm / map.yaml on save
 ```
 
@@ -60,9 +60,10 @@ files keep working. The work happens on the `dev` branch.
   happens in its own thread. If publishing falls behind, the oldest frames are dropped
   (`max_publish_queue`) rather than slowing down SLAM.
 * For each scan GLIM emits two estimates: a prediction (`on_new_frame`, IMU integration only) and the
-  optimized one (`on_update_new_frame`). Topics without the `_corrected` suffix carry the prediction,
-  `_corrected` topics and TF carry the optimized estimate. Neither includes loop closures; those are
-  applied through `map->odom` (`T_world_odom`, updated when the global map is optimized).
+  optimized one (`on_update_new_frame`). Topics without the `_corrected` suffix carry the prediction;
+  `_corrected` topics, `odometry/*` and TF carry the optimized estimate. Odometry in the `odom` frame
+  never includes loop closures; those are applied through `map->odom` (`T_world_odom`, updated when the
+  global map is optimized), which `pose*`, `odometry/global` and the map frame use.
 
 ### Map and occupancy grid
 
@@ -163,7 +164,7 @@ Publishing is lazy: a message is only built when the topic has subscribers.
 | `odom_scanend`, `odom_scanend_corrected` | `nav_msgs/Odometry` | `odom` → child | Pose at the end of the scan (needs `save_imu_rate_trajectory`) |
 | `lidar_odom*` | `nav_msgs/Odometry` | `odom` → lidar | As above, always in the LiDAR frame |
 | `pose`, `pose_corrected`, `pose_scanend*` | `geometry_msgs/PoseStamped` | `map` | Body pose with loop closure |
-| `pose_corrected_with_cov`, `pose_scanend_corrected_with_cov` | `PoseWithCovarianceStamped` | `map` | With covariance (when GLIM computes it) |
+| `pose_corrected_with_cov`, `pose_scanend_corrected_with_cov` | `PoseWithCovarianceStamped` | `map` | With covariance (GLIM's, or the fallback variances) |
 | `lidar_pose*` | Pose(WithCovariance)Stamped | `map` | LiDAR pose |
 | `imu_bias`, `imu_bias_with_cov` | `Twist(WithCovariance)Stamped` | imu | [acc bias; gyro bias] |
 | `points`, `points_corrected` | `PointCloud2` | sensor | Preprocessed scan |
@@ -201,8 +202,40 @@ and in the EKF: `odom0: /glim_ros/odometry/local`, `world_frame: odom`, `publish
 
 ## Build
 
-Same as upstream (see the [GLIM docs](https://koide3.github.io/glim/)). Requires a GLIM version that
-provides frame covariances (`EstimationFrame::pose_cov`, koide3/glim ≥ 1a197c9, Oct 2026).
+Same as upstream (see the [GLIM docs](https://koide3.github.io/glim/)), plus the ROS packages
+`std_srvs`, `diagnostic_updater` and `diagnostic_msgs` (`rosdep install --from-paths src -y`).
+Requires a GLIM version that provides frame covariances (`EstimationFrame::pose_cov`,
+koide3/glim ≥ 1a197c9, Oct 2026); older GLIM commits (e.g. a9be365) do not compile.
+
+## Known limitations
+
+* **No localization-only mode** (load a saved map, relocalize, `/initialpose`). It needs changes inside
+  GLIM's mapping modules, not only in this ROS interface, so it is out of scope for this fork.
+* **Per-point LiDAR timestamps matter.** Drivers that stamp a cloud at the *end* of the sweep (e.g. the
+  Velodyne driver, per-point times ≈ −0.1…0 s) make GLIM see a ~0 s scan unless the per-point time
+  settings in `config_sensors.json` are adjusted: deskewing is then effectively disabled,
+  `*_scanend` topics equal the scan pose, and odometry/velocity are noisier.
+* `odometry/imu_rate` propagates GLIM's velocity estimate between scans, so its error grows with the
+  velocity error; prefer `odometry/local` as an EKF input unless the velocity estimate is good.
+* The occupancy grid is a 2.5D height-band heuristic (good for static maps, not a costmap); tall
+  vegetation and overhangs need tuning of `grid_z_*`.
+* One GLIM instance per process (GLIM uses process-wide singletons and static callbacks).
+* The ROS output module keeps the upstream library name `librviz_viewer.so` so existing configs work.
+* No lifecycle-node variant.
+
+## Validation
+
+Changes were validated by replaying recorded robot bags (Velodyne + IMU, CPU odometry) into
+`glim_rosnode` on sim time and comparing against the unmodified upstream build:
+
+* TF: no duplicated stamps (upstream: every `map->odom`/`odom->base` stamp sent twice); one parent per
+  frame with robot_localization in `map_odom_mode:=external`, and `map->odom ∘ odom->base` reproducing
+  GLIM's global pose (median 3 cm with the same-scan transform).
+* Twist: body-frame velocity matches pose differentiation better than a world-frame reading (upstream:
+  the opposite); yaw rate correlates 0.995 with pose differentiation (upstream: always 0).
+* Latency of `odom_corrected` unchanged (~0.19 s) with every heavy topic subscribed.
+* `save_map` during a run (no odometry stall), `map.yaml` loaded by `nav2_map_server`; runtime
+  parameters, restart-only rejection, `/diagnostics`, `imu->lidar` conflict detection; `glim_rosbag`.
 
 ## Upstream
 

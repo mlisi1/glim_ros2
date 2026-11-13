@@ -281,13 +281,15 @@ GlimROS::~GlimROS() {
   if (save_thread.joinable()) {
     save_thread.join();
   }
-  extension_modules.clear();
 
+  // Flush and save while the extension modules are still alive: GLIM callbacks reference them
   if (dump_on_unload) {
-    std::string dump_path = "/tmp/dump";
+    const std::string dump_path = this->get_parameter("dump_path").as_string();
     wait(true);
     save(dump_path);
   }
+
+  extension_modules.clear();
 }
 
 const std::vector<std::shared_ptr<GenericTopicSubscription>>& GlimROS::extension_subscriptions() {
@@ -347,9 +349,12 @@ void GlimROS::imu_callback(const sensor_msgs::msg::Imu::SharedPtr msg) {
 #ifdef BUILD_WITH_CV_BRIDGE
 void GlimROS::image_callback(const sensor_msgs::msg::Image::ConstSharedPtr msg) {
   spdlog::trace("image: {}.{}", msg->header.stamp.sec, msg->header.stamp.nanosec);
-  if (!GlobalConfig::instance()->has_param("meta", "image_frame")) {
-    spdlog::debug("auto-detecting image frame ID: {}", msg->header.frame_id);
-    GlobalConfig::instance()->override_param<std::string>("meta", "image_frame", msg->header.frame_id);
+  {
+    std::lock_guard<std::mutex> lock(config_mutex);
+    if (!GlobalConfig::instance()->has_param("meta", "image_frame")) {
+      spdlog::debug("auto-detecting image frame ID: {}", msg->header.frame_id);
+      GlobalConfig::instance()->override_param<std::string>("meta", "image_frame", msg->header.frame_id);
+    }
   }
 
   auto cv_image = cv_bridge::toCvCopy(msg, "bgr8");

@@ -1,6 +1,7 @@
 #include <glim_ros/rviz_viewer.hpp>
 
 #include <mutex>
+#include <future>
 #include <ctime>
 #include <fstream>
 #include <iomanip>
@@ -693,8 +694,13 @@ void RvizViewer::publish_frame(const FrameTask& task) {
           T_odom_base.linear() = Eigen::Quaterniond(r.w, r.x, r.y, r.z).normalized().toRotationMatrix();
 
           const Eigen::Isometry3d T_map_base = T_world_imu * (*T_imu_base);
-          const Eigen::Isometry3d T_map_odom = T_map_base * T_odom_base.inverse();
-          latest_T_map_odom = map_odom_planar ? flatten(T_map_odom) : T_map_odom;
+          if (map_odom_planar) {
+            // Flatten both poses before composing: flattening the composed 3D transform would rotate the external
+            // odom->base translation by GLIM's residual roll/pitch (meters of error far from the odom origin)
+            latest_T_map_odom = flatten(T_map_base) * flatten(T_odom_base).inverse();
+          } else {
+            latest_T_map_odom = T_map_base * T_odom_base.inverse();
+          }
           last_map_odom_pub = rclcpp::Time(0, 0, clock->get_clock_type());  // publish right away
         } catch (const tf2::TransformException& e) {
           static std::chrono::steady_clock::time_point last_warn;
@@ -902,6 +908,7 @@ void RvizViewer::check_imu_lidar_tf() {
   std::string parent;
   if (tf_buffer->_getParent(lidar_frame_id, tf2::TimePointZero, parent) && parent != imu_frame_id) {
     logger->warn("{} already has parent {} in TF (URDF?); not publishing {} -> {}", lidar_frame_id, parent, imu_frame_id, lidar_frame_id);
+    imu_lidar_refused = true;
     publish_tf_imu_lidar = false;
   }
 }
@@ -998,11 +1005,12 @@ rcl_interfaces::msg::SetParametersResult RvizViewer::on_set_parameters(const std
   for (const auto& p : params) {
     const auto& n = p.get_name();
     if (n == "publish_tf") {
-      publish_tf_map_odom = publish_tf_odom_base = p.as_bool();
-      publish_tf_imu_lidar = p.as_bool();
+      publish_tf_map_odom = p.as_bool();
+      publish_tf_odom_base = p.as_bool() && !map_odom_external;
+      publish_tf_imu_lidar = p.as_bool() && !imu_lidar_refused;
     } else if (n == "publish_tf_map_odom") publish_tf_map_odom = p.as_bool();
     else if (n == "publish_tf_odom_base") publish_tf_odom_base = p.as_bool() && !map_odom_external;
-    else if (n == "publish_tf_imu_lidar") publish_tf_imu_lidar = p.as_bool();
+    else if (n == "publish_tf_imu_lidar") publish_tf_imu_lidar = p.as_bool() && !imu_lidar_refused;
     else if (n == "tf_time_offset") tf_time_offset = p.as_double();
     else if (n == "map_odom_planar") map_odom_planar = p.as_bool();
     else if (n == "map_odom_rate") map_odom_rate = p.as_double();
@@ -1022,7 +1030,6 @@ rcl_interfaces::msg::SetParametersResult RvizViewer::on_set_parameters(const std
   }
 
   if (grid_changed) {
-    std::lock_guard<std::mutex> lock(map_mutex);
     grid_dirty = true;
   }
   return result;
@@ -1284,6 +1291,17 @@ void RvizViewer::publish_map_and_grid() {
 }
 
 void RvizViewer::at_exit(const std::string& dump_path) {
+  // Submap updates are applied asynchronously by the map thread: wait until everything queued so far
+  // (e.g., the last submaps and the final optimization before shutdown) has been applied.
+  if (map_thread.joinable() && !kill_switch) {
+    auto done = std::make_shared<std::promise<void>>();
+    auto applied = done->get_future();
+    invoke([done] { done->set_value(); });
+    if (applied.wait_for(std::chrono::seconds(60)) != std::future_status::ready) {
+      logger->warn("timeout while waiting for pending map updates; saving the current map");
+    }
+  }
+
   std::lock_guard<std::mutex> lock(map_mutex);
   if (submap_caches.empty() || !clock) {
     return;
@@ -1301,7 +1319,7 @@ void RvizViewer::at_exit(const std::string& dump_path) {
       ofs.write(reinterpret_cast<const char*>(p.data()), sizeof(float) * 3);
     }
   }
-  logger->info("saved {} ({} points)", dump_path + "/map.pcd", map->size());
+  logger->info("saved {} ({} points, {} submaps)", dump_path + "/map.pcd", map->size(), std::min(submap_caches.size(), submap_poses.size()));
 
   // Occupancy grid (nav2_map_server trinary format)
   const auto grid = build_grid();
@@ -1319,7 +1337,7 @@ void RvizViewer::at_exit(const std::string& dump_path) {
 
     std::ofstream yaml(dump_path + "/map.yaml");
     yaml << std::setprecision(9) << "image: map.pgm\nmode: trinary\nresolution: " << grid->info.resolution << "\norigin: [" << grid->info.origin.position.x << ", "
-         << grid->info.origin.position.y << ", 0.0]\nnegate: 0\noccupied_thresh: 0.65\nfree_thresh: 0.25\n";
+         << grid->info.origin.position.y << ", 0.0]\nnegate: 0\noccupied_thresh: 0.65\nfree_thresh: 0.196\n";
     logger->info("saved {} ({}x{} cells)", dump_path + "/map.yaml", W, H);
   }
 }

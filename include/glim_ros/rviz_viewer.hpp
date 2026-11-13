@@ -135,7 +135,7 @@ private:
   // map->odom computation
   //  internal: relative to GLIM's own odometry frame (GLIM also owns odom->base)
   //  external: relative to an odom->base transform published by someone else (e.g. robot_localization)
-  bool map_odom_external;
+  std::atomic_bool map_odom_external{false};
   std::atomic_bool map_odom_planar;          // keep only x, y, yaw of map->odom
   std::atomic<double> map_odom_rate;          // [Hz] republish rate in external mode
   std::atomic<double> map_odom_tolerance;     // [s] future-dating of republished map->odom (as AMCL's transform_tolerance)
@@ -172,6 +172,7 @@ private:
   std::atomic<double> fallback_velocity_var;  // [m^2/s^2]
 
   bool imu_lidar_checked = false;
+  std::atomic_bool imu_lidar_refused{false};  // LiDAR frame has another parent in TF
   rclcpp::node_interfaces::OnSetParametersCallbackHandle::SharedPtr param_callback;
   std::mutex T_imu_base_mutex;
   std::optional<Eigen::Isometry3d> T_imu_base;  // cached static transform
@@ -225,8 +226,8 @@ private:
   std::mutex map_mutex;
   std::vector<SubmapCache> submap_caches;
   std::vector<Eigen::Isometry3d, Eigen::aligned_allocator<Eigen::Isometry3d>> submap_poses;
-  bool map_dirty;
-  bool grid_dirty;
+  std::atomic_bool map_dirty{false};
+  std::atomic_bool grid_dirty{false};
   size_t last_map_subs;
   size_t last_grid_subs;
   rclcpp::Time last_grid_pub_time;
