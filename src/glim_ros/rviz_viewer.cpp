@@ -102,7 +102,11 @@ BodyState make_body_state(
   s.pose_cov.setZero();
   if (C_pose_imu) {
     const gtsam::Matrix6 Ad_T_X_imu = gtsam::Pose3(T_imu_X.inverse().matrix()).AdjointMap();
-    s.pose_cov = reorder_cov(Ad_T_X_imu * (*C_pose_imu) * Ad_T_X_imu.transpose());
+    // GTSAM's covariance is in the body (right-perturbation) frame of X; ROS expects it about the parent's fixed axes
+    RowMajor6 R6 = RowMajor6::Zero();
+    R6.block<3, 3>(0, 0) = s.T_parent_X.linear();
+    R6.block<3, 3>(3, 3) = s.T_parent_X.linear();
+    s.pose_cov = R6 * reorder_cov(Ad_T_X_imu * (*C_pose_imu) * Ad_T_X_imu.transpose()) * R6.transpose();
   }
 
   s.twist_cov.setZero();
@@ -192,6 +196,9 @@ RvizViewer::RvizViewer() : logger(create_module_logger("rviz")) {
   odom_child_frame = BodyFrame::IMU;
   twist_angular_cov = 1e-2;
   twist_angular_window = 0.1;
+  fallback_position_var = 1e-2;
+  fallback_rotation_var = 1e-3;
+  fallback_velocity_var = 1e-2;
   max_frame_queue = 64;
   map_odom_external = false;
   map_odom_planar = false;
@@ -235,6 +242,14 @@ std::vector<GenericTopicSubscription::Ptr> RvizViewer::create_subscriptions(rclc
   tf_broadcaster = std::make_unique<tf2_ros::TransformBroadcaster>(node);
 
   // --- ROS parameters (declared on the glim_ros node, so they can be set from launch files) ---
+  // Frame IDs: config_ros.json values are the defaults
+  imu_frame_id = node.declare_parameter<std::string>("imu_frame_id", imu_frame_id);
+  lidar_frame_id = node.declare_parameter<std::string>("lidar_frame_id", lidar_frame_id);
+  base_frame_id = node.declare_parameter<std::string>("base_frame_id", base_frame_id);
+  odom_frame_id = node.declare_parameter<std::string>("odom_frame_id", odom_frame_id);
+  map_frame_id = node.declare_parameter<std::string>("map_frame_id", map_frame_id);
+  tf_time_offset = node.declare_parameter<double>("tf_time_offset", tf_time_offset);
+
   // publish_tf is a master switch; the individual switches default to it.
   const bool publish_tf = node.declare_parameter<bool>("publish_tf", true);
   publish_tf_map_odom = node.declare_parameter<bool>("publish_tf_map_odom", publish_tf);
@@ -255,6 +270,9 @@ std::vector<GenericTopicSubscription::Ptr> RvizViewer::create_subscriptions(rclc
 
   twist_angular_cov = node.declare_parameter<double>("twist_angular_cov", twist_angular_cov);
   twist_angular_window = node.declare_parameter<double>("twist_angular_window", twist_angular_window);
+  fallback_position_var = node.declare_parameter<double>("fallback_position_var", fallback_position_var);
+  fallback_rotation_var = node.declare_parameter<double>("fallback_rotation_var", fallback_rotation_var);
+  fallback_velocity_var = node.declare_parameter<double>("fallback_velocity_var", fallback_velocity_var);
   max_frame_queue = std::max<int64_t>(1, node.declare_parameter<int64_t>("max_publish_queue", static_cast<int64_t>(max_frame_queue)));
 
   const std::string map_odom_mode = node.declare_parameter<std::string>("map_odom_mode", "internal");
@@ -273,11 +291,11 @@ std::vector<GenericTopicSubscription::Ptr> RvizViewer::create_subscriptions(rclc
 
   logger->info(
     "TF: map->odom={} ({}{}) odom->base={} imu->lidar={} | odom_child_frame={}",
-    publish_tf_map_odom,
+    publish_tf_map_odom.load(),
     map_odom_mode,
     map_odom_planar ? ", planar" : "",
-    publish_tf_odom_base,
-    publish_tf_imu_lidar,
+    publish_tf_odom_base.load(),
+    publish_tf_imu_lidar.load(),
     child);
 
   map_voxel_size = node.declare_parameter<double>("map_voxel_size", map_voxel_size);
@@ -318,6 +336,7 @@ std::vector<GenericTopicSubscription::Ptr> RvizViewer::create_subscriptions(rclc
 
   create(odometry_local_pub, "odometry/local", qos);
   create(odometry_global_pub, "odometry/global", qos);
+  create(odometry_imu_rate_pub, "odometry/imu_rate", rclcpp::QoS(50));
 
   create(map_pub, "map", map_qos);
   create(grid_pub, "grid", map_qos);
@@ -364,6 +383,9 @@ std::vector<GenericTopicSubscription::Ptr> RvizViewer::create_subscriptions(rclc
   last_map_odom_pub = clock->now();
   last_grid_pub_time = clock->now();
 
+  // Parameters that can be changed at runtime (ros2 param set)
+  param_callback = node.add_on_set_parameters_callback([this](const std::vector<rclcpp::Parameter>& params) { return on_set_parameters(params); });
+
   initialized = true;
   queue_cv.notify_all();
 
@@ -373,7 +395,7 @@ std::vector<GenericTopicSubscription::Ptr> RvizViewer::create_subscriptions(rclc
 void RvizViewer::set_callbacks() {
   using std::placeholders::_1;
   OdometryEstimationCallbacks::on_insert_imu.add(
-    [this](const double stamp, const Eigen::Vector3d& linear_acc, const Eigen::Vector3d& angular_vel) { on_insert_imu(stamp, angular_vel); });
+    [this](const double stamp, const Eigen::Vector3d& linear_acc, const Eigen::Vector3d& angular_vel) { on_insert_imu(stamp, linear_acc, angular_vel); });
   OdometryEstimationCallbacks::on_new_frame.add([this](const EstimationFrame::ConstPtr& new_frame) { on_new_frame(new_frame, false); });
   OdometryEstimationCallbacks::on_update_new_frame.add([this](const EstimationFrame::ConstPtr& new_frame) { on_new_frame(new_frame, true); });
   GlobalMappingCallbacks::on_update_submaps.add(std::bind(&RvizViewer::globalmap_on_update_submaps, this, _1));
@@ -388,26 +410,37 @@ bool RvizViewer::should_warn(std::chrono::steady_clock::time_point& last, double
   return true;
 }
 
-void RvizViewer::on_insert_imu(double stamp, const Eigen::Vector3d& angular_vel) {
-  std::lock_guard<std::mutex> lock(imu_mutex);
-  gyro_buffer.emplace_back(stamp, angular_vel.x(), angular_vel.y(), angular_vel.z());
-  while (!gyro_buffer.empty() && gyro_buffer.front()[0] < stamp - 5.0) {
-    gyro_buffer.pop_front();
+void RvizViewer::on_insert_imu(double stamp, const Eigen::Vector3d& linear_acc, const Eigen::Vector3d& angular_vel) {
+  {
+    std::lock_guard<std::mutex> lock(imu_mutex);
+    ImuSample sample;
+    sample << stamp, linear_acc, angular_vel;
+    imu_buffer.push_back(sample);
+    while (!imu_buffer.empty() && imu_buffer.front()[0] < stamp - 5.0) {
+      imu_buffer.pop_front();
+    }
+  }
+  if (imu_rate_active) {
+    {
+      std::lock_guard<std::mutex> lock(queue_mutex);
+      new_imu = true;
+    }
+    queue_cv.notify_one();
   }
 }
 
 // Mean gyro reading in [t0, t1]; falls back to the sample closest to the window center
 Eigen::Vector3d RvizViewer::mean_gyro(double t0, double t1) {
   std::lock_guard<std::mutex> lock(imu_mutex);
-  if (gyro_buffer.empty()) {
+  if (imu_buffer.empty()) {
     return Eigen::Vector3d::Zero();
   }
 
   Eigen::Vector3d sum = Eigen::Vector3d::Zero();
   int n = 0;
-  const Eigen::Vector4d* closest = &gyro_buffer.front();
+  const ImuSample* closest = &imu_buffer.front();
   const double tc = 0.5 * (t0 + t1);
-  for (const auto& g : gyro_buffer) {
+  for (const auto& g : imu_buffer) {
     if (g[0] >= t0 && g[0] <= t1) {
       sum += g.tail<3>();
       n++;
@@ -450,9 +483,9 @@ void RvizViewer::worker_loop() {
     std::deque<FrameTask> frames;
     {
       std::unique_lock<std::mutex> lock(queue_mutex);
-      const double wait_sec = map_odom_external ? std::min(0.1, 0.5 / std::max(map_odom_rate, 1.0)) : 0.1;
+      const double wait_sec = map_odom_external ? std::min(0.1, 0.5 / std::max(map_odom_rate.load(), 1.0)) : 0.1;
       queue_cv.wait_for(lock, std::chrono::duration<double>(wait_sec), [this] {
-        return kill_switch || (initialized && !frame_queue.empty());
+        return kill_switch || (initialized && (!frame_queue.empty() || new_imu));
       });
       if (kill_switch) {
         break;
@@ -461,12 +494,16 @@ void RvizViewer::worker_loop() {
         continue;
       }
       frames.swap(frame_queue);
+      new_imu = false;
     }
 
     for (const auto& frame : frames) {
       publish_frame(frame);
     }
     publish_map_odom_periodic();
+
+    imu_rate_active = has_subs(odometry_imu_rate_pub);
+    publish_imu_rate();
   }
 }
 
@@ -476,7 +513,7 @@ void RvizViewer::publish_map_odom_periodic() {
     return;
   }
   const rclcpp::Time now = clock->now();
-  if ((now - last_map_odom_pub).seconds() < 1.0 / std::max(map_odom_rate, 1e-3)) {
+  if ((now - last_map_odom_pub).seconds() < 1.0 / std::max(map_odom_rate.load(), 1e-3)) {
     return;
   }
   last_map_odom_pub = now;
@@ -568,9 +605,16 @@ void RvizViewer::publish_frame(const FrameTask& task) {
   const Eigen::Isometry3d T_world_imu = T_world_odom * T_odom_imu;
 
   // Covariances (only available for optimized frames when enabled in GLIM)
-  const gtsam::Matrix6* C_pose = new_frame->cov_computed ? &new_frame->pose_cov : nullptr;
-  const Eigen::Matrix3d C_vel_odom = new_frame->vel_cov;
-  const Eigen::Matrix3d* C_vel_odom_ptr = new_frame->cov_computed ? &C_vel_odom : nullptr;
+  // Covariances: GLIM's when computed (compute_covs), otherwise configurable fallbacks (never all-zero)
+  gtsam::Matrix6 C_pose_fallback = gtsam::Matrix6::Zero();
+  C_pose_fallback.diagonal() << Eigen::Vector3d::Constant(fallback_rotation_var), Eigen::Vector3d::Constant(fallback_position_var);
+  const gtsam::Matrix6* C_pose = new_frame->cov_computed ? &new_frame->pose_cov : &C_pose_fallback;
+  const Eigen::Matrix3d C_vel_odom = new_frame->cov_computed ? Eigen::Matrix3d(new_frame->vel_cov) : Eigen::Matrix3d(fallback_velocity_var * Eigen::Matrix3d::Identity());
+  const Eigen::Matrix3d* C_vel_odom_ptr = &C_vel_odom;
+
+  if (corrected) {
+    latest_state = ImuState{new_frame->stamp, T_odom_imu, v_odom_imu, new_frame->imu_bias, T_lidar_imu};
+  }
 
   // Angular velocity: bias-corrected gyro averaged around the frame stamp (IMU frame)
   const Eigen::Vector3d gyro_bias = new_frame->imu_bias.tail<3>();
@@ -661,6 +705,7 @@ void RvizViewer::publish_frame(const FrameTask& task) {
       }
     }
 
+    check_imu_lidar_tf();
     if (publish_tf_imu_lidar) {
       // TF parent->child carries the pose of the child in the parent frame, i.e., T_imu_lidar
       trans.header.frame_id = imu_frame_id;
@@ -846,6 +891,141 @@ void RvizViewer::publish_frame(const FrameTask& task) {
     auto points = frame_to_pointcloud2(map_frame_id, new_frame->stamp, frame);
     aligned_points_pub->publish(*points);
   }
+}
+
+// Refuse to publish imu->lidar if the LiDAR frame already has another parent (e.g., from the URDF)
+void RvizViewer::check_imu_lidar_tf() {
+  if (imu_lidar_checked || !publish_tf_imu_lidar) {
+    return;
+  }
+  imu_lidar_checked = true;
+  std::string parent;
+  if (tf_buffer->_getParent(lidar_frame_id, tf2::TimePointZero, parent) && parent != imu_frame_id) {
+    logger->warn("{} already has parent {} in TF (URDF?); not publishing {} -> {}", lidar_frame_id, parent, imu_frame_id, lidar_frame_id);
+    publish_tf_imu_lidar = false;
+  }
+}
+
+// ~/odometry/imu_rate: propagate the latest optimized state with the IMU samples received since (strapdown, bias-corrected)
+void RvizViewer::publish_imu_rate() {
+  if (!imu_rate_active || !latest_state) {
+    return;
+  }
+
+  std::vector<ImuSample, Eigen::aligned_allocator<ImuSample>> samples;
+  {
+    std::lock_guard<std::mutex> lock(imu_mutex);
+    for (const auto& imu : imu_buffer) {
+      if (imu[0] > latest_state->stamp) {
+        samples.push_back(imu);
+      }
+    }
+  }
+  if (samples.empty() || samples.back()[0] <= last_imu_rate_stamp) {
+    return;
+  }
+
+  const Eigen::Vector3d gravity(0.0, 0.0, -9.80665);
+  const Eigen::Vector3d acc_bias = latest_state->bias.head<3>();
+  const Eigen::Vector3d gyro_bias = latest_state->bias.tail<3>();
+
+  Eigen::Matrix3d R = latest_state->T_odom_imu.linear();
+  Eigen::Vector3d p = latest_state->T_odom_imu.translation();
+  Eigen::Vector3d v = latest_state->v_odom_imu;
+  Eigen::Vector3d w = Eigen::Vector3d::Zero();
+  double t = latest_state->stamp;
+  for (const auto& imu : samples) {
+    const double dt = imu[0] - t;
+    if (dt <= 0.0) continue;
+    const Eigen::Vector3d a_world = R * (imu.segment<3>(1) - acc_bias) + gravity;
+    w = imu.segment<3>(4) - gyro_bias;
+    p += v * dt + 0.5 * a_world * dt * dt;
+    v += a_world * dt;
+    const double angle = w.norm() * dt;
+    if (angle > 1e-12) {
+      R = R * Eigen::AngleAxisd(angle, w.normalized()).toRotationMatrix();
+    }
+    t = imu[0];
+  }
+  last_imu_rate_stamp = t;
+
+  std::optional<Eigen::Isometry3d> T_imu_child;
+  std::string child_frame_id;
+  switch (odom_child_frame) {
+    case BodyFrame::IMU:
+      T_imu_child = Eigen::Isometry3d::Identity();
+      child_frame_id = imu_frame_id;
+      break;
+    case BodyFrame::LIDAR:
+      T_imu_child = latest_state->T_lidar_imu.inverse();
+      child_frame_id = lidar_frame_id;
+      break;
+    case BodyFrame::BASE:
+      T_imu_child = lookup_T_imu_base();
+      child_frame_id = base_frame_id;
+      break;
+  }
+  if (!T_imu_child) {
+    return;
+  }
+
+  Eigen::Isometry3d T = Eigen::Isometry3d::Identity();
+  T.linear() = Eigen::Quaterniond(R).normalized().toRotationMatrix();
+  T.translation() = p;
+  const Eigen::Matrix3d C_vel = fallback_velocity_var * Eigen::Matrix3d::Identity();
+  const auto state = make_body_state(T, v, w, nullptr, &C_vel, twist_angular_cov, *T_imu_child);
+  odometry_imu_rate_pub->publish(to_odom_msg(state, from_sec(t), odom_frame_id, child_frame_id));
+}
+
+rcl_interfaces::msg::SetParametersResult RvizViewer::on_set_parameters(const std::vector<rclcpp::Parameter>& params) {
+  rcl_interfaces::msg::SetParametersResult result;
+  result.successful = true;
+
+  static const std::set<std::string> restart_required = {
+    "imu_frame_id", "lidar_frame_id", "base_frame_id", "odom_frame_id", "map_frame_id", "odom_child_frame", "outputs",
+    "map_odom_mode", "max_publish_queue", "map_voxel_size", "grid_resolution"};
+
+  bool grid_changed = false;
+  for (const auto& p : params) {
+    const auto& n = p.get_name();
+    if (restart_required.count(n)) {
+      result.successful = false;
+      result.reason = n + " cannot be changed at runtime (restart required)";
+      return result;
+    }
+  }
+
+  for (const auto& p : params) {
+    const auto& n = p.get_name();
+    if (n == "publish_tf") {
+      publish_tf_map_odom = publish_tf_odom_base = p.as_bool();
+      publish_tf_imu_lidar = p.as_bool();
+    } else if (n == "publish_tf_map_odom") publish_tf_map_odom = p.as_bool();
+    else if (n == "publish_tf_odom_base") publish_tf_odom_base = p.as_bool() && !map_odom_external;
+    else if (n == "publish_tf_imu_lidar") publish_tf_imu_lidar = p.as_bool();
+    else if (n == "tf_time_offset") tf_time_offset = p.as_double();
+    else if (n == "map_odom_planar") map_odom_planar = p.as_bool();
+    else if (n == "map_odom_rate") map_odom_rate = p.as_double();
+    else if (n == "map_odom_tolerance") map_odom_tolerance = p.as_double();
+    else if (n == "external_odom_timeout") external_odom_timeout = p.as_double();
+    else if (n == "twist_angular_cov") twist_angular_cov = p.as_double();
+    else if (n == "twist_angular_window") twist_angular_window = p.as_double();
+    else if (n == "fallback_position_var") fallback_position_var = p.as_double();
+    else if (n == "fallback_rotation_var") fallback_rotation_var = p.as_double();
+    else if (n == "fallback_velocity_var") fallback_velocity_var = p.as_double();
+    else if (n == "map_publish_period") map_publish_period = p.as_double();
+    else if (n == "grid_z_min") { grid_z_min = p.as_double(); grid_changed = true; }
+    else if (n == "grid_z_max") { grid_z_max = p.as_double(); grid_changed = true; }
+    else if (n == "grid_min_points") { grid_min_points = p.as_int(); grid_changed = true; }
+    else if (n == "grid_max_range") { grid_max_range = p.as_double(); grid_changed = true; }
+    else if (n == "grid_ground_cell") { grid_ground_cell = p.as_double(); grid_changed = true; }
+  }
+
+  if (grid_changed) {
+    std::lock_guard<std::mutex> lock(map_mutex);
+    grid_dirty = true;
+  }
+  return result;
 }
 
 void RvizViewer::globalmap_on_update_submaps(const std::vector<SubMap::Ptr>& submaps) {

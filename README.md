@@ -25,6 +25,10 @@ files keep working. The work happens on the `dev` branch.
 | Map | Full-resolution concatenation of all submaps every 10 s, built in the publishing thread | Per-submap voxelized cache, rebuilt with the current (loop-closed) poses only when changed, in its own thread |
 | Navigation map | None | `~/grid` 2D occupancy grid (`nav_msgs/OccupancyGrid`) |
 | Saving | Only at shutdown, to `/tmp/dump` | `~/save_map` service at any time: GLIM dump + `map.pcd` + `map.pgm`/`map.yaml` (nav2_map_server) |
+| Configuration | JSON files only | `config_ros.json` keys (topics, frames, offsets, modules...) can be overridden by ROS parameters; several parameters can be changed at runtime |
+| Covariances | All zeros unless GLIM's `compute_covs` is enabled; body-frame | Configurable fallbacks; pose covariance expressed about the parent frame's axes (REP-103/ROS convention) |
+| Execution | Single-threaded; point cloud preprocessing blocks IMU callbacks; 1 kHz polling timer | Multi-threaded executor with separate IMU / points / timer callback groups; 100 Hz timer |
+| Monitoring | None | `/diagnostics` (input/output rates, workload, stalls); `~/odometry/imu_rate` |
 
 ## How it works
 
@@ -46,8 +50,10 @@ files keep working. The work happens on the `dev` branch.
 ```
 
 * **GlimROS** (`src/glim_ros/glim_ros.cpp`) subscribes to IMU / point cloud (/ image) topics, feeds GLIM
-  and moves results between the asynchronous GLIM stages. GLIM's configuration (sensor topics, frame
-  IDs, modules) is read from the JSON files in `config_path`.
+  and moves results between the asynchronous GLIM stages. IMU and point clouds are handled in separate
+  callback groups of a multi-threaded executor, so cloud conversion/preprocessing never delays IMU
+  input. GLIM's configuration is read from the JSON files in `config_path`; the ROS-side keys can be
+  overridden by ROS parameters.
 * **The ROS output module** (`src/glim_ros/rviz_viewer.cpp`, historically called "rviz viewer") turns
   GLIM estimates into ROS messages. GLIM invokes its callbacks synchronously from the estimation
   threads, so the module only stores the (immutable) estimation frame and returns; everything else
@@ -103,6 +109,12 @@ false in this mode. `map_odom_planar:=true` keeps only x, y, yaw (useful with a 
 | Parameter | Default | Description |
 |---|---|---|
 | `config_path` | `config` | GLIM config directory (relative paths resolved against the `glim` package) |
+| `imu_topic`, `points_topic`, `image_topic` | from `config_ros.json` | Input topics |
+| `imu_frame_id`, `lidar_frame_id`, `base_frame_id`, `odom_frame_id`, `map_frame_id` | from `config_ros.json` | Frame IDs (IMU / LiDAR auto-detected when empty; base defaults to IMU) |
+| `imu_time_offset`, `points_time_offset`, `acc_scale`, `ang_scale`, `keep_raw_points` | from `config_ros.json` | Input corrections |
+| `enable_local_mapping`, `enable_global_mapping`, `extension_modules` | from `config_ros.json` | Pipeline composition |
+| `intensity_field`, `ring_field` | from `config_sensors.json` | Point cloud fields |
+| `tf_time_offset` | from `config_ros.json` | [s] added to TF stamps |
 | `publish_tf` | `true` | Master default for the three switches below |
 | `publish_tf_map_odom` | `publish_tf` | Publish `map -> odom` |
 | `publish_tf_odom_base` | `publish_tf` | Publish `odom -> base` (ignored in external mode) |
@@ -115,6 +127,7 @@ false in this mode. `map_odom_planar:=true` keeps only x, y, yaw (useful with a 
 | `odom_child_frame` | `imu` | Body frame of `odom*`, `pose*`, `odometry/*`: `imu`, `lidar`, `base` |
 | `twist_angular_window` | `0.1` | [s] gyro averaging window around the scan stamp |
 | `twist_angular_cov` | `0.01` | [rad²/s²] variance reported for the angular velocity |
+| `fallback_position_var`, `fallback_rotation_var`, `fallback_velocity_var` | `0.01`, `0.001`, `0.01` | Variances reported when GLIM does not compute covariances (`compute_covs: false`) |
 | `outputs` | `["all"]` | Topics to create (names below, without `~/`) |
 | `max_publish_queue` | `64` | Frames buffered for publishing before dropping the oldest |
 | `shutdown_on_extension_exit` | `false` | Upstream behavior: shut down when a viewer window is closed |
@@ -127,9 +140,15 @@ false in this mode. `map_odom_planar:=true` keeps only x, y, yaw (useful with a 
 | `grid_ground_cell` | `1.0` | [m] column size for the local ground estimate |
 | `grid_max_range` | `30.0` | [m] maximum range used for obstacles and free-space carving |
 | `debug`, `dump_on_unload`, `dump_path` | | As upstream |
+| `debug_log_path` | `/tmp/glim_log.log` | Log file when `debug` is true |
 
-Sensor topics, frame IDs, QoS and GLIM modules are still configured in `config_ros.json` /
-`config_*.json` of `config_path`.
+QoS profiles and the GLIM algorithm parameters stay in the JSON files of `config_path`.
+
+**Runtime changes** (`ros2 param set /glim_ros <name> <value>`): `publish_tf*`, `tf_time_offset`,
+`map_odom_planar`, `map_odom_rate`, `map_odom_tolerance`, `external_odom_timeout`, `twist_angular_*`,
+`fallback_*_var`, `map_publish_period`, `grid_z_min`, `grid_z_max`, `grid_min_points`, `grid_max_range`,
+`grid_ground_cell`. Frame IDs, `odom_child_frame`, `outputs`, `map_odom_mode`, `map_voxel_size` and
+`grid_resolution` are rejected at runtime (restart required); the others are read at startup.
 
 ## Topics (all under the node namespace, `/glim_ros/...` by default)
 
@@ -139,6 +158,7 @@ Publishing is lazy: a message is only built when the topic has subscribers.
 |---|---|---|---|
 | `odometry/local` | `nav_msgs/Odometry` | `odom` → child | Optimized odometry (no loop closure); twist in child frame |
 | `odometry/global` | `nav_msgs/Odometry` | `map` → child | Same with loop closure applied |
+| `odometry/imu_rate` | `nav_msgs/Odometry` | `odom` → child | Latest optimized state propagated with every new IMU sample (bias-corrected strapdown); low latency, but inherits GLIM's velocity error between scans |
 | `odom`, `odom_corrected` | `nav_msgs/Odometry` | `odom` → child | Prediction / optimized (upstream names) |
 | `odom_scanend`, `odom_scanend_corrected` | `nav_msgs/Odometry` | `odom` → child | Pose at the end of the scan (needs `save_imu_rate_trajectory`) |
 | `lidar_odom*` | `nav_msgs/Odometry` | `odom` → lidar | As above, always in the LiDAR frame |
@@ -152,6 +172,11 @@ Publishing is lazy: a message is only built when the topic has subscribers.
 | `grid` | `nav_msgs/OccupancyGrid` (latched) | `map` | 2D occupancy grid |
 
 Service: `save_map` (`std_srvs/Trigger`) — response `message` is the output directory.
+
+Diagnostics: `/diagnostics`, status `GLIM` — IMU / point cloud / odometry rates, rejected clouds,
+odometry workload; WARN when inputs stop or odometry falls behind, ERROR when clouds arrive but no
+odometry is produced. Covariances in `odom*`, `pose*_with_cov` and `odometry/*` are expressed about
+the axes of the header frame (rotated from GTSAM's body frame).
 
 Saving at shutdown happens after Ctrl-C and can take a few seconds on large maps; increase the launch
 `sigterm_timeout` (default 5 s) or call `save_map` before stopping.

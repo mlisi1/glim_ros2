@@ -44,8 +44,12 @@ namespace glim {
 
 GlimROS::GlimROS(const rclcpp::NodeOptions& options) : Node("glim_ros", options) {
   // Setup logger
-  auto logger = spdlog::stdout_color_mt("glim");
-  logger->sinks().push_back(get_ringbuffer_sink());
+  // Reuse the logger if it already exists (e.g., a second instance in the same process)
+  auto logger = spdlog::get("glim");
+  if (!logger) {
+    logger = spdlog::stdout_color_mt("glim");
+    logger->sinks().push_back(get_ringbuffer_sink());
+  }
   spdlog::set_default_logger(logger);
 
   bool debug = false;
@@ -54,12 +58,15 @@ GlimROS::GlimROS(const rclcpp::NodeOptions& options) : Node("glim_ros", options)
 
   if (debug) {
     spdlog::info("enable debug printing");
-    auto file_sink = std::make_shared<spdlog::sinks::basic_file_sink_mt>("/tmp/glim_log.log", true);
+    const std::string debug_log_path = this->declare_parameter<std::string>("debug_log_path", "/tmp/glim_log.log");
+    auto file_sink = std::make_shared<spdlog::sinks::basic_file_sink_mt>(debug_log_path, true);
     logger->sinks().push_back(file_sink);
     logger->set_level(spdlog::level::trace);
 
     print_system_info(logger);
   }
+
+  this->declare_parameter<std::string>("dump_path", "/tmp/dump");
 
   dump_on_unload = false;
   this->declare_parameter<bool>("dump_on_unload", false);
@@ -85,15 +92,21 @@ GlimROS::GlimROS(const rclcpp::NodeOptions& options) : Node("glim_ros", options)
   glim::GlobalConfig::instance(config_path);
   glim::Config config_ros(glim::GlobalConfig::get_config_path("config_ros"));
 
-  keep_raw_points = config_ros.param<bool>("glim_ros", "keep_raw_points", false);
-  imu_time_offset = config_ros.param<double>("glim_ros", "imu_time_offset", 0.0);
-  points_time_offset = config_ros.param<double>("glim_ros", "points_time_offset", 0.0);
-  acc_scale = config_ros.param<double>("glim_ros", "acc_scale", 0.0);
-  ang_scale = config_ros.param<double>("glim_ros", "ang_scale", 1.0);
+  // config_ros.json values can be overridden by ROS parameters of the same name (the JSON value is the default)
+  const auto ros_param = [&](const std::string& name, const auto& json_default) {
+    using T = std::decay_t<decltype(json_default)>;
+    return this->declare_parameter<T>(name, config_ros.param<T>("glim_ros", name, json_default));
+  };
+
+  keep_raw_points = ros_param("keep_raw_points", false);
+  imu_time_offset = ros_param("imu_time_offset", 0.0);
+  points_time_offset = ros_param("points_time_offset", 0.0);
+  acc_scale = ros_param("acc_scale", 0.0);
+  ang_scale = ros_param("ang_scale", 1.0);
 
   glim::Config config_sensors(glim::GlobalConfig::get_config_path("config_sensors"));
-  intensity_field = config_sensors.param<std::string>("sensors", "intensity_field", "intensity");
-  ring_field = config_sensors.param<std::string>("sensors", "ring_field", "");
+  intensity_field = this->declare_parameter<std::string>("intensity_field", config_sensors.param<std::string>("sensors", "intensity_field", "intensity"));
+  ring_field = this->declare_parameter<std::string>("ring_field", config_sensors.param<std::string>("sensors", "ring_field", ""));
 
   // Setup GPU-based linearization
 #ifdef BUILD_GTSAM_POINTS_GPU
@@ -117,7 +130,7 @@ GlimROS::GlimROS(const rclcpp::NodeOptions& options) : Node("glim_ros", options)
   odometry_estimation.reset(new glim::AsyncOdometryEstimation(odom, odom->requires_imu()));
 
   // Sub mapping
-  if (config_ros.param<bool>("glim_ros", "enable_local_mapping", true)) {
+  if (ros_param("enable_local_mapping", true)) {
     const std::string sub_mapping_so_name =
       glim::Config(glim::GlobalConfig::get_config_path("config_sub_mapping")).param<std::string>("sub_mapping", "so_name", "libsub_mapping.so");
     if (!sub_mapping_so_name.empty()) {
@@ -130,7 +143,7 @@ GlimROS::GlimROS(const rclcpp::NodeOptions& options) : Node("glim_ros", options)
   }
 
   // Global mapping
-  if (config_ros.param<bool>("glim_ros", "enable_global_mapping", true)) {
+  if (ros_param("enable_global_mapping", true)) {
     const std::string global_mapping_so_name =
       glim::Config(glim::GlobalConfig::get_config_path("config_global_mapping")).param<std::string>("global_mapping", "so_name", "libglobal_mapping.so");
     if (!global_mapping_so_name.empty()) {
@@ -143,7 +156,7 @@ GlimROS::GlimROS(const rclcpp::NodeOptions& options) : Node("glim_ros", options)
   }
 
   // Extention modules
-  const auto extensions = config_ros.param<std::vector<std::string>>("glim_ros", "extension_modules");
+  const auto extensions = std::make_optional(ros_param("extension_modules", std::vector<std::string>{}));
   if (extensions && !extensions->empty()) {
     for (const auto& extension : *extensions) {
       if (extension.find("viewer") == std::string::npos && extension.find("monitor") == std::string::npos) {
@@ -182,18 +195,30 @@ GlimROS::GlimROS(const rclcpp::NodeOptions& options) : Node("glim_ros", options)
 
   // ROS-related
   using std::placeholders::_1;
-  const std::string imu_topic = config_ros.param<std::string>("glim_ros", "imu_topic", "");
-  const std::string points_topic = config_ros.param<std::string>("glim_ros", "points_topic", "");
-  const std::string image_topic = config_ros.param<std::string>("glim_ros", "image_topic", "");
+  const std::string imu_topic = ros_param("imu_topic", std::string());
+  const std::string points_topic = ros_param("points_topic", std::string());
+  const std::string image_topic = ros_param("image_topic", std::string());
+
+  // IMU and points run in separate callback groups (with a multi-threaded executor) so that a slow point cloud
+  // conversion/preprocessing never delays IMU input. The timer moving results between stages has its own group.
+  imu_callback_group = this->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
+  points_callback_group = this->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
+  timer_callback_group = this->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
+  rclcpp::SubscriptionOptions imu_options;
+  imu_options.callback_group = imu_callback_group;
+  rclcpp::SubscriptionOptions points_options;
+  points_options.callback_group = points_callback_group;
 
   // Subscribers
   rclcpp::SensorDataQoS default_imu_qos;
   default_imu_qos.get_rmw_qos_profile().depth = 1000;
   auto qos = get_qos_settings(config_ros, "glim_ros", "imu_qos", default_imu_qos);
-  imu_sub = this->create_subscription<sensor_msgs::msg::Imu>(imu_topic, qos, std::bind(&GlimROS::imu_callback, this, _1));
+  imu_sub = this->create_subscription<sensor_msgs::msg::Imu>(imu_topic, qos, std::bind(&GlimROS::imu_callback, this, _1), imu_options);
 
-  qos = get_qos_settings(config_ros, "glim_ros", "points_qos");
-  points_sub = this->create_subscription<sensor_msgs::msg::PointCloud2>(points_topic, qos, std::bind(&GlimROS::points_callback, this, _1));
+  rclcpp::SensorDataQoS default_points_qos;
+  default_points_qos.keep_last(10);
+  qos = get_qos_settings(config_ros, "glim_ros", "points_qos", default_points_qos);
+  points_sub = this->create_subscription<sensor_msgs::msg::PointCloud2>(points_topic, qos, std::bind(&GlimROS::points_callback, this, _1), points_options);
 #ifdef BUILD_WITH_CV_BRIDGE
   qos = get_qos_settings(config_ros, "glim_ros", "image_qos");
   image_sub = image_transport::create_subscription(this, image_topic, std::bind(&GlimROS::image_callback, this, _1), "raw", qos.get_rmw_qos_profile());
@@ -239,7 +264,14 @@ GlimROS::GlimROS(const rclcpp::NodeOptions& options) : Node("glim_ros", options)
     });
 
   // Start timer
-  timer = this->create_wall_timer(std::chrono::milliseconds(1), [this]() { timer_callback(); });
+  timer = this->create_wall_timer(std::chrono::milliseconds(10), [this]() { timer_callback(); }, timer_callback_group);
+
+  // Diagnostics (/diagnostics, 1 Hz)
+  last_imu_time = last_points_time = last_odom_time = std::chrono::steady_clock::now();
+  last_diag_time = std::chrono::steady_clock::now();
+  diagnostics = std::make_unique<diagnostic_updater::Updater>(this);
+  diagnostics->setHardwareID("glim");
+  diagnostics->add("GLIM", this, &GlimROS::diagnostics_callback);
 
   spdlog::debug("initialized");
 }
@@ -264,9 +296,15 @@ const std::vector<std::shared_ptr<GenericTopicSubscription>>& GlimROS::extension
 
 void GlimROS::imu_callback(const sensor_msgs::msg::Imu::SharedPtr msg) {
   spdlog::trace("IMU: {}.{}", msg->header.stamp.sec, msg->header.stamp.nanosec);
-  if (!GlobalConfig::instance()->has_param("meta", "imu_frame_id")) {
-    spdlog::debug("auto-detecting IMU frame ID: {}", msg->header.frame_id);
-    GlobalConfig::instance()->override_param<std::string>("meta", "imu_frame_id", msg->header.frame_id);
+  num_imu++;
+  last_imu_time = std::chrono::steady_clock::now();
+  if (!imu_frame_detected) {
+    std::lock_guard<std::mutex> lock(config_mutex);
+    if (!GlobalConfig::instance()->has_param("meta", "imu_frame_id")) {
+      spdlog::debug("auto-detecting IMU frame ID: {}", msg->header.frame_id);
+      GlobalConfig::instance()->override_param<std::string>("meta", "imu_frame_id", msg->header.frame_id);
+    }
+    imu_frame_detected = true;
   }
 
   if (std::abs(acc_scale) < 1e-6) {
@@ -287,7 +325,12 @@ void GlimROS::imu_callback(const sensor_msgs::msg::Imu::SharedPtr msg) {
   const Eigen::Vector3d linear_acc = acc_scale * Eigen::Vector3d(msg->linear_acceleration.x, msg->linear_acceleration.y, msg->linear_acceleration.z);
   const Eigen::Vector3d angular_vel = ang_scale * Eigen::Vector3d(msg->angular_velocity.x, msg->angular_velocity.y, msg->angular_velocity.z);
 
-  if (!time_keeper->validate_imu_stamp(imu_stamp)) {
+  bool valid_stamp;
+  {
+    std::lock_guard<std::mutex> lock(time_keeper_mutex);
+    valid_stamp = time_keeper->validate_imu_stamp(imu_stamp);
+  }
+  if (!valid_stamp) {
     spdlog::warn("skip an invalid IMU data (stamp={})", imu_stamp);
     return;
   }
@@ -324,9 +367,15 @@ void GlimROS::image_callback(const sensor_msgs::msg::Image::ConstSharedPtr msg) 
 
 size_t GlimROS::points_callback(const sensor_msgs::msg::PointCloud2::ConstSharedPtr msg) {
   spdlog::trace("points: {}.{}", msg->header.stamp.sec, msg->header.stamp.nanosec);
-  if (!GlobalConfig::instance()->has_param("meta", "lidar_frame_id")) {
-    spdlog::debug("auto-detecting LiDAR frame ID: {}", msg->header.frame_id);
-    GlobalConfig::instance()->override_param<std::string>("meta", "lidar_frame_id", msg->header.frame_id);
+  num_points++;
+  last_points_time = std::chrono::steady_clock::now();
+  if (!lidar_frame_detected) {
+    std::lock_guard<std::mutex> lock(config_mutex);
+    if (!GlobalConfig::instance()->has_param("meta", "lidar_frame_id")) {
+      spdlog::debug("auto-detecting LiDAR frame ID: {}", msg->header.frame_id);
+      GlobalConfig::instance()->override_param<std::string>("meta", "lidar_frame_id", msg->header.frame_id);
+    }
+    lidar_frame_detected = true;
   }
 
   auto raw_points = glim::extract_raw_points(*msg, intensity_field, ring_field);
@@ -336,7 +385,13 @@ size_t GlimROS::points_callback(const sensor_msgs::msg::PointCloud2::ConstShared
   }
 
   raw_points->stamp += points_time_offset;
-  if (!time_keeper->process(raw_points)) {
+  bool valid_points;
+  {
+    std::lock_guard<std::mutex> lock(time_keeper_mutex);
+    valid_points = time_keeper->process(raw_points);
+  }
+  if (!valid_points) {
+    num_points_rejected++;
     spdlog::warn("skip an invalid point cloud (stamp={})", raw_points->stamp);
     return 0;
   }
@@ -351,6 +406,7 @@ size_t GlimROS::points_callback(const sensor_msgs::msg::PointCloud2::ConstShared
   odometry_estimation->insert_frame(preprocessed);
 
   const size_t workload = odometry_estimation->workload();
+  last_workload = workload;
   spdlog::debug("workload={}", workload);
 
   return workload;
@@ -385,6 +441,10 @@ void GlimROS::timer_callback() {
   std::vector<glim::EstimationFrame::ConstPtr> estimation_frames;
   std::vector<glim::EstimationFrame::ConstPtr> marginalized_frames;
   odometry_estimation->get_results(estimation_frames, marginalized_frames);
+  if (!estimation_frames.empty()) {
+    num_odom += estimation_frames.size();
+    last_odom_time = std::chrono::steady_clock::now();
+  }
 
   if (sub_mapping) {
     for (const auto& frame : marginalized_frames) {
@@ -432,6 +492,33 @@ void GlimROS::wait(bool auto_quit) {
         terminate |= (!ext_module->ok());
       }
     }
+  }
+}
+
+void GlimROS::diagnostics_callback(diagnostic_updater::DiagnosticStatusWrapper& stat) {
+  const auto now = std::chrono::steady_clock::now();
+  const double dt = std::chrono::duration<double>(now - last_diag_time).count();
+  last_diag_time = now;
+  const auto age = [&](const std::chrono::steady_clock::time_point& t) { return std::chrono::duration<double>(now - t).count(); };
+
+  const size_t imu = num_imu.exchange(0), points = num_points.exchange(0), rejected = num_points_rejected.exchange(0), odom = num_odom.exchange(0);
+  stat.add("imu_rate [Hz]", dt > 0 ? imu / dt : 0.0);
+  stat.add("points_rate [Hz]", dt > 0 ? points / dt : 0.0);
+  stat.add("odometry_rate [Hz]", dt > 0 ? odom / dt : 0.0);
+  stat.add("points_rejected", rejected);
+  stat.add("odometry_workload", static_cast<size_t>(last_workload));
+  stat.add("time_since_last_odometry [s]", age(last_odom_time));
+
+  if (age(last_points_time) > 2.0) {
+    stat.summary(diagnostic_msgs::msg::DiagnosticStatus::WARN, "no point clouds received");
+  } else if (age(last_odom_time) > 3.0) {
+    stat.summary(diagnostic_msgs::msg::DiagnosticStatus::ERROR, "point clouds arriving but no odometry output");
+  } else if (age(last_imu_time) > 1.0) {
+    stat.summary(diagnostic_msgs::msg::DiagnosticStatus::WARN, "no IMU data received");
+  } else if (last_workload > 10) {
+    stat.summary(diagnostic_msgs::msg::DiagnosticStatus::WARN, "odometry is falling behind");
+  } else {
+    stat.summary(diagnostic_msgs::msg::DiagnosticStatus::OK, "running");
   }
 }
 
