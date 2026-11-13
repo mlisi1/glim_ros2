@@ -1,6 +1,7 @@
 #include <glim_ros/rviz_viewer.hpp>
 
 #include <mutex>
+#include <set>
 #include <spdlog/spdlog.h>
 #include <rclcpp/clock.hpp>
 
@@ -142,6 +143,21 @@ geometry_msgs::msg::PoseWithCovarianceStamped to_pose_with_cov(const BodyState& 
   return pose;
 }
 
+template <typename PubT>
+bool has_subs(const std::shared_ptr<PubT>& pub) {
+  return pub && pub->get_subscription_count() > 0;
+}
+
+// Keep only x, y, yaw
+Eigen::Isometry3d flatten(const Eigen::Isometry3d& T) {
+  const Eigen::Matrix3d R = T.linear();
+  const double yaw = std::atan2(R(1, 0), R(0, 0));
+  Eigen::Isometry3d F = Eigen::Isometry3d::Identity();
+  F.linear() = Eigen::AngleAxisd(yaw, Eigen::Vector3d::UnitZ()).toRotationMatrix();
+  F.translation() << T.translation().x(), T.translation().y(), 0.0;
+  return F;
+}
+
 Eigen::Isometry3d imu_traj_pose(const Eigen::Matrix<double, 8, 1>& x) {
   // [t, x, y, z, qx, qy, qz, qw]
   Eigen::Isometry3d T = Eigen::Isometry3d::Identity();
@@ -171,6 +187,11 @@ RvizViewer::RvizViewer() : logger(create_module_logger("rviz")) {
   twist_angular_cov = 1e-2;
   twist_angular_window = 0.1;
   max_frame_queue = 64;
+  map_odom_external = false;
+  map_odom_planar = false;
+  map_odom_rate = 20.0;
+  map_odom_tolerance = 0.1;
+  external_odom_timeout = 0.1;
 
   trajectory.reset(new TrajectoryManager);
 
@@ -216,12 +237,42 @@ std::vector<GenericTopicSubscription::Ptr> RvizViewer::create_subscriptions(rclc
   twist_angular_window = node.declare_parameter<double>("twist_angular_window", twist_angular_window);
   max_frame_queue = std::max<int64_t>(1, node.declare_parameter<int64_t>("max_publish_queue", static_cast<int64_t>(max_frame_queue)));
 
+  const std::string map_odom_mode = node.declare_parameter<std::string>("map_odom_mode", "internal");
+  if (map_odom_mode != "internal" && map_odom_mode != "external") {
+    logger->error("unknown map_odom_mode '{}' (expected internal|external). using internal", map_odom_mode);
+  }
+  map_odom_external = map_odom_mode == "external";
+  map_odom_planar = node.declare_parameter<bool>("map_odom_planar", map_odom_planar);
+  map_odom_rate = node.declare_parameter<double>("map_odom_rate", map_odom_rate);
+  map_odom_tolerance = node.declare_parameter<double>("map_odom_tolerance", map_odom_tolerance);
+  external_odom_timeout = node.declare_parameter<double>("external_odom_timeout", external_odom_timeout);
+  if (map_odom_external && publish_tf_odom_base) {
+    logger->warn("map_odom_mode=external: odom->base is owned by the external odometry; disabling publish_tf_odom_base");
+    publish_tf_odom_base = false;
+  }
+
   logger->info(
-    "TF: map->odom={} odom->base={} imu->lidar={} | odom_child_frame={}",
+    "TF: map->odom={} ({}{}) odom->base={} imu->lidar={} | odom_child_frame={}",
     publish_tf_map_odom,
+    map_odom_mode,
+    map_odom_planar ? ", planar" : "",
     publish_tf_odom_base,
     publish_tf_imu_lidar,
     child);
+
+  // --- Outputs ---
+  const auto outputs_param = node.declare_parameter<std::vector<std::string>>("outputs", std::vector<std::string>{"all"});
+  const std::set<std::string> outputs(outputs_param.begin(), outputs_param.end());
+  std::set<std::string> known;
+  const auto create = [&](auto& pub, const std::string& name, const rclcpp::QoS& qos) {
+    using MsgT = typename std::decay_t<decltype(*pub)>::ROSMessageType;
+    known.insert(name);
+    if (outputs.count("all") || outputs.count(name)) {
+      pub = node.create_publisher<MsgT>("~/" + name, qos);
+    } else {
+      pub = nullptr;
+    }
+  };
 
   rmw_qos_profile_t map_qos_profile = {
     RMW_QOS_POLICY_HISTORY_KEEP_LAST,
@@ -233,43 +284,54 @@ std::vector<GenericTopicSubscription::Ptr> RvizViewer::create_subscriptions(rclc
     RMW_QOS_POLICY_LIVELINESS_SYSTEM_DEFAULT,
     RMW_QOS_LIVELINESS_LEASE_DURATION_DEFAULT,
     false};
-  rclcpp::QoS map_qos(rclcpp::QoSInitialization(map_qos_profile.history, map_qos_profile.depth), map_qos_profile);
-  map_pub = node.create_publisher<sensor_msgs::msg::PointCloud2>("~/map", map_qos);
+  const rclcpp::QoS map_qos(rclcpp::QoSInitialization(map_qos_profile.history, map_qos_profile.depth), map_qos_profile);
+  const rclcpp::QoS qos(10);
 
-  points_pub = node.create_publisher<sensor_msgs::msg::PointCloud2>("~/points", 10);
-  points_corrected_pub = node.create_publisher<sensor_msgs::msg::PointCloud2>("~/points_corrected", 10);
+  create(odometry_local_pub, "odometry/local", qos);
+  create(odometry_global_pub, "odometry/global", qos);
 
-  aligned_points_pub = node.create_publisher<sensor_msgs::msg::PointCloud2>("~/aligned_points", 10);
-  aligned_points_corrected_pub = node.create_publisher<sensor_msgs::msg::PointCloud2>("~/aligned_points_corrected", 10);
+  create(map_pub, "map", map_qos);
 
-  odom_pub = node.create_publisher<nav_msgs::msg::Odometry>("~/odom", 10);
-  odom_scanend_pub = node.create_publisher<nav_msgs::msg::Odometry>("~/odom_scanend", 10);
-  odom_corrected_pub = node.create_publisher<nav_msgs::msg::Odometry>("~/odom_corrected", 10);
-  odom_scanend_corrected_pub = node.create_publisher<nav_msgs::msg::Odometry>("~/odom_scanend_corrected", 10);
+  create(points_pub, "points", qos);
+  create(points_corrected_pub, "points_corrected", qos);
+  create(aligned_points_pub, "aligned_points", qos);
+  create(aligned_points_corrected_pub, "aligned_points_corrected", qos);
 
-  lidar_odom_pub = node.create_publisher<nav_msgs::msg::Odometry>("~/lidar_odom", 10);
-  lidar_odom_scanend_pub = node.create_publisher<nav_msgs::msg::Odometry>("~/lidar_odom_scanend", 10);
-  lidar_odom_corrected_pub = node.create_publisher<nav_msgs::msg::Odometry>("~/lidar_odom_corrected", 10);
-  lidar_odom_scanend_corrected_pub = node.create_publisher<nav_msgs::msg::Odometry>("~/lidar_odom_scanend_corrected", 10);
+  create(odom_pub, "odom", qos);
+  create(odom_scanend_pub, "odom_scanend", qos);
+  create(odom_corrected_pub, "odom_corrected", qos);
+  create(odom_scanend_corrected_pub, "odom_scanend_corrected", qos);
 
-  pose_pub = node.create_publisher<geometry_msgs::msg::PoseStamped>("~/pose", 10);
-  pose_scanend_pub = node.create_publisher<geometry_msgs::msg::PoseStamped>("~/pose_scanend", 10);
-  pose_corrected_pub = node.create_publisher<geometry_msgs::msg::PoseStamped>("~/pose_corrected", 10);
-  pose_scanend_corrected_pub = node.create_publisher<geometry_msgs::msg::PoseStamped>("~/pose_scanend_corrected", 10);
-  pose_corrected_with_cov_pub = node.create_publisher<geometry_msgs::msg::PoseWithCovarianceStamped>("~/pose_corrected_with_cov", 10);
-  pose_scanend_corrected_with_cov_pub = node.create_publisher<geometry_msgs::msg::PoseWithCovarianceStamped>("~/pose_scanend_corrected_with_cov", 10);
+  create(lidar_odom_pub, "lidar_odom", qos);
+  create(lidar_odom_scanend_pub, "lidar_odom_scanend", qos);
+  create(lidar_odom_corrected_pub, "lidar_odom_corrected", qos);
+  create(lidar_odom_scanend_corrected_pub, "lidar_odom_scanend_corrected", qos);
 
-  lidar_pose_pub = node.create_publisher<geometry_msgs::msg::PoseStamped>("~/lidar_pose", 10);
-  lidar_pose_scanend_pub = node.create_publisher<geometry_msgs::msg::PoseStamped>("~/lidar_pose_scanend", 10);
-  lidar_pose_corrected_pub = node.create_publisher<geometry_msgs::msg::PoseStamped>("~/lidar_pose_corrected", 10);
-  lidar_pose_scanend_corrected_pub = node.create_publisher<geometry_msgs::msg::PoseStamped>("~/lidar_pose_scanend_corrected", 10);
-  lidar_pose_corrected_with_cov_pub = node.create_publisher<geometry_msgs::msg::PoseWithCovarianceStamped>("~/lidar_pose_corrected_with_cov", 10);
-  lidar_pose_scanend_corrected_with_cov_pub = node.create_publisher<geometry_msgs::msg::PoseWithCovarianceStamped>("~/lidar_pose_scanend_corrected_with_cov", 10);
+  create(pose_pub, "pose", qos);
+  create(pose_scanend_pub, "pose_scanend", qos);
+  create(pose_corrected_pub, "pose_corrected", qos);
+  create(pose_scanend_corrected_pub, "pose_scanend_corrected", qos);
+  create(pose_corrected_with_cov_pub, "pose_corrected_with_cov", qos);
+  create(pose_scanend_corrected_with_cov_pub, "pose_scanend_corrected_with_cov", qos);
 
-  imu_bias_pub = node.create_publisher<geometry_msgs::msg::TwistStamped>("~/imu_bias", 10);
-  imu_bias_with_cov_pub = node.create_publisher<geometry_msgs::msg::TwistWithCovarianceStamped>("~/imu_bias_with_cov", 10);
+  create(lidar_pose_pub, "lidar_pose", qos);
+  create(lidar_pose_scanend_pub, "lidar_pose_scanend", qos);
+  create(lidar_pose_corrected_pub, "lidar_pose_corrected", qos);
+  create(lidar_pose_scanend_corrected_pub, "lidar_pose_scanend_corrected", qos);
+  create(lidar_pose_corrected_with_cov_pub, "lidar_pose_corrected_with_cov", qos);
+  create(lidar_pose_scanend_corrected_with_cov_pub, "lidar_pose_scanend_corrected_with_cov", qos);
+
+  create(imu_bias_pub, "imu_bias", qos);
+  create(imu_bias_with_cov_pub, "imu_bias_with_cov", qos);
+
+  for (const auto& name : outputs) {
+    if (name != "all" && !known.count(name)) {
+      logger->warn("unknown output '{}' in 'outputs' parameter", name);
+    }
+  }
 
   last_globalmap_pub_time = clock->now();
+  last_map_odom_pub = clock->now();
 
   initialized = true;
   queue_cv.notify_all();
@@ -358,7 +420,8 @@ void RvizViewer::worker_loop() {
     std::vector<std::function<void()>> tasks;
     {
       std::unique_lock<std::mutex> lock(queue_mutex);
-      queue_cv.wait_for(lock, std::chrono::milliseconds(100), [this] {
+      const double wait_sec = map_odom_external ? std::min(0.1, 0.5 / std::max(map_odom_rate, 1.0)) : 0.1;
+      queue_cv.wait_for(lock, std::chrono::duration<double>(wait_sec), [this] {
         return kill_switch || (initialized && (!frame_queue.empty() || !invoke_queue.empty()));
       });
       if (kill_switch) {
@@ -377,7 +440,27 @@ void RvizViewer::worker_loop() {
     for (const auto& frame : frames) {
       publish_frame(frame);
     }
+    publish_map_odom_periodic();
   }
+}
+
+// External mode: republish the latest map->odom at a fixed rate, future-dated so that lookups at "now" succeed
+void RvizViewer::publish_map_odom_periodic() {
+  if (!map_odom_external || !publish_tf_map_odom || !latest_T_map_odom) {
+    return;
+  }
+  const rclcpp::Time now = clock->now();
+  if ((now - last_map_odom_pub).seconds() < 1.0 / std::max(map_odom_rate, 1e-3)) {
+    return;
+  }
+  last_map_odom_pub = now;
+
+  geometry_msgs::msg::TransformStamped trans;
+  trans.header.stamp = now + rclcpp::Duration::from_seconds(map_odom_tolerance);
+  trans.header.frame_id = map_frame_id;
+  trans.child_frame_id = odom_frame_id;
+  trans.transform = to_transform_msg(*latest_T_map_odom);
+  tf_broadcaster->sendTransform(trans);
 }
 
 void RvizViewer::resolve_frame_ids() {
@@ -516,11 +599,36 @@ void RvizViewer::publish_frame(const FrameTask& task) {
       }
     }
 
-    if (publish_tf_map_odom) {
+    if (publish_tf_map_odom && !map_odom_external) {
       trans.header.frame_id = map_frame_id;
       trans.child_frame_id = odom_frame_id;
-      trans.transform = to_transform_msg(T_world_odom);
+      trans.transform = to_transform_msg(map_odom_planar ? flatten(T_world_odom) : T_world_odom);
       tf_broadcaster->sendTransform(trans);
+    }
+
+    if (map_odom_external) {
+      // T_map_odom = T_map_base (GLIM, with loop closure) * T_odom_base(external, same stamp)^-1
+      const auto T_imu_base = lookup_T_imu_base();
+      if (T_imu_base) {
+        try {
+          const auto ext = tf_buffer->lookupTransform(odom_frame_id, base_frame_id, from_sec(new_frame->stamp), rclcpp::Duration::from_seconds(external_odom_timeout));
+          const auto& t = ext.transform.translation;
+          const auto& r = ext.transform.rotation;
+          Eigen::Isometry3d T_odom_base = Eigen::Isometry3d::Identity();
+          T_odom_base.translation() << t.x, t.y, t.z;
+          T_odom_base.linear() = Eigen::Quaterniond(r.w, r.x, r.y, r.z).normalized().toRotationMatrix();
+
+          const Eigen::Isometry3d T_map_base = T_world_imu * (*T_imu_base);
+          const Eigen::Isometry3d T_map_odom = T_map_base * T_odom_base.inverse();
+          latest_T_map_odom = map_odom_planar ? flatten(T_map_odom) : T_map_odom;
+          last_map_odom_pub = rclcpp::Time(0, 0, clock->get_clock_type());  // publish right away
+        } catch (const tf2::TransformException& e) {
+          static std::chrono::steady_clock::time_point last_warn;
+          if (should_warn(last_warn, 5.0)) {
+            logger->warn("map_odom_mode=external: failed to lookup external {} -> {}: {}", odom_frame_id, base_frame_id, e.what());
+          }
+        }
+      }
     }
 
     if (publish_tf_imu_lidar) {
@@ -539,28 +647,40 @@ void RvizViewer::publish_frame(const FrameTask& task) {
     }
   };
 
+  // --- ~/odometry/local (odom frame, smoother output) and ~/odometry/global (map frame, with loop closure) ---
+  if (corrected && T_imu_child && has_subs(odometry_local_pub)) {
+    const auto s = make_body_state(T_odom_imu, v_odom_imu, w_imu, C_pose, C_vel_odom_ptr, twist_angular_cov, *T_imu_child);
+    odometry_local_pub->publish(to_odom_msg(s, stamp, odom_frame_id, child_frame_id));
+  }
+  if (corrected && T_imu_child && has_subs(odometry_global_pub)) {
+    const Eigen::Vector3d v_world_imu = T_world_odom.linear() * v_odom_imu;
+    const Eigen::Matrix3d C_vel_world = T_world_odom.linear() * C_vel_odom * T_world_odom.linear().transpose();
+    const auto s = make_body_state(T_world_imu, v_world_imu, w_imu, C_pose, C_vel_odom_ptr ? &C_vel_world : nullptr, twist_angular_cov, *T_imu_child);
+    odometry_global_pub->publish(to_odom_msg(s, stamp, map_frame_id, child_frame_id));
+  }
+
   // --- Odometry (odom frame, without loop closure) ---
   auto& odom_pub = !corrected ? this->odom_pub : this->odom_corrected_pub;
   auto& lidar_odom_pub = !corrected ? this->lidar_odom_pub : this->lidar_odom_corrected_pub;
-  if (T_imu_child && odom_pub->get_subscription_count()) {
+  if (T_imu_child && has_subs(odom_pub)) {
     const auto s = make_body_state(T_odom_imu, v_odom_imu, w_imu, C_pose, C_vel_odom_ptr, twist_angular_cov, *T_imu_child);
     odom_pub->publish(to_odom_msg(s, stamp, odom_frame_id, child_frame_id));
   }
-  if (lidar_odom_pub->get_subscription_count()) {
+  if (has_subs(lidar_odom_pub)) {
     const auto s = make_body_state(T_odom_imu, v_odom_imu, w_imu, C_pose, C_vel_odom_ptr, twist_angular_cov, T_imu_lidar);
     lidar_odom_pub->publish(to_odom_msg(s, stamp, odom_frame_id, lidar_frame_id));
   }
 
   auto& odom_scan_end_pub = !corrected ? this->odom_scanend_pub : this->odom_scanend_corrected_pub;
   auto& lidar_odom_scan_end_pub = !corrected ? this->lidar_odom_scanend_pub : this->lidar_odom_scanend_corrected_pub;
-  if ((T_imu_child && odom_scan_end_pub->get_subscription_count()) || lidar_odom_scan_end_pub->get_subscription_count()) {
+  if ((T_imu_child && has_subs(odom_scan_end_pub)) || has_subs(lidar_odom_scan_end_pub)) {
     warn_scanend();
     const Eigen::Isometry3d T_odom_imuend = T_odom_imu * T_imubegin_imuend;
-    if (T_imu_child && odom_scan_end_pub->get_subscription_count()) {
+    if (T_imu_child && has_subs(odom_scan_end_pub)) {
       const auto s = make_body_state(T_odom_imuend, v_odom_imu, w_imu, nullptr, nullptr, twist_angular_cov, *T_imu_child);
       odom_scan_end_pub->publish(to_odom_msg(s, imu_end_stamp, odom_frame_id, child_frame_id));
     }
-    if (lidar_odom_scan_end_pub->get_subscription_count()) {
+    if (has_subs(lidar_odom_scan_end_pub)) {
       const auto s = make_body_state(T_odom_imuend, v_odom_imu, w_imu, nullptr, nullptr, twist_angular_cov, T_imu_lidar);
       lidar_odom_scan_end_pub->publish(to_odom_msg(s, imu_end_stamp, odom_frame_id, lidar_frame_id));
     }
@@ -570,21 +690,21 @@ void RvizViewer::publish_frame(const FrameTask& task) {
   auto& pose_pub = !corrected ? this->pose_pub : this->pose_corrected_pub;
   auto& lidar_pose_pub = !corrected ? this->lidar_pose_pub : this->lidar_pose_corrected_pub;
   // Covariance topics exist only for the corrected estimates
-  const bool publish_pose_with_cov = corrected && pose_corrected_with_cov_pub->get_subscription_count();
-  const bool publish_lidar_pose_with_cov = corrected && lidar_pose_corrected_with_cov_pub->get_subscription_count();
+  const bool publish_pose_with_cov = corrected && has_subs(pose_corrected_with_cov_pub);
+  const bool publish_lidar_pose_with_cov = corrected && has_subs(lidar_pose_corrected_with_cov_pub);
 
-  if (T_imu_child && (pose_pub->get_subscription_count() || publish_pose_with_cov)) {
+  if (T_imu_child && (has_subs(pose_pub) || publish_pose_with_cov)) {
     const auto s = make_body_state(T_world_imu, Eigen::Vector3d::Zero(), w_imu, C_pose, nullptr, twist_angular_cov, *T_imu_child);
-    if (pose_pub->get_subscription_count()) {
+    if (has_subs(pose_pub)) {
       pose_pub->publish(to_pose_stamped(s, stamp, map_frame_id));
     }
     if (publish_pose_with_cov) {
       pose_corrected_with_cov_pub->publish(to_pose_with_cov(s, stamp, map_frame_id));
     }
   }
-  if (lidar_pose_pub->get_subscription_count() || publish_lidar_pose_with_cov) {
+  if (has_subs(lidar_pose_pub) || publish_lidar_pose_with_cov) {
     const auto s = make_body_state(T_world_imu, Eigen::Vector3d::Zero(), w_imu, C_pose, nullptr, twist_angular_cov, T_imu_lidar);
-    if (lidar_pose_pub->get_subscription_count()) {
+    if (has_subs(lidar_pose_pub)) {
       lidar_pose_pub->publish(to_pose_stamped(s, stamp, map_frame_id));
     }
     if (publish_lidar_pose_with_cov) {
@@ -594,10 +714,10 @@ void RvizViewer::publish_frame(const FrameTask& task) {
 
   auto& pose_scan_end_pub = !corrected ? this->pose_scanend_pub : this->pose_scanend_corrected_pub;
   auto& lidar_pose_scan_end_pub = !corrected ? this->lidar_pose_scanend_pub : this->lidar_pose_scanend_corrected_pub;
-  const bool publish_pose_scanend_with_cov = corrected && pose_scanend_corrected_with_cov_pub->get_subscription_count();
-  const bool publish_lidar_pose_scanend_with_cov = corrected && lidar_pose_scanend_corrected_with_cov_pub->get_subscription_count();
-  const bool want_pose_scanend = T_imu_child && (pose_scan_end_pub->get_subscription_count() || publish_pose_scanend_with_cov);
-  const bool want_lidar_pose_scanend = lidar_pose_scan_end_pub->get_subscription_count() || publish_lidar_pose_scanend_with_cov;
+  const bool publish_pose_scanend_with_cov = corrected && has_subs(pose_scanend_corrected_with_cov_pub);
+  const bool publish_lidar_pose_scanend_with_cov = corrected && has_subs(lidar_pose_scanend_corrected_with_cov_pub);
+  const bool want_pose_scanend = T_imu_child && (has_subs(pose_scan_end_pub) || publish_pose_scanend_with_cov);
+  const bool want_lidar_pose_scanend = has_subs(lidar_pose_scan_end_pub) || publish_lidar_pose_scanend_with_cov;
   if (want_pose_scanend || want_lidar_pose_scanend) {
     warn_scanend();
     const Eigen::Isometry3d T_world_imuend = T_world_imu * T_imubegin_imuend;
@@ -612,7 +732,7 @@ void RvizViewer::publish_frame(const FrameTask& task) {
 
     if (want_pose_scanend) {
       const auto s = make_body_state(T_world_imuend, Eigen::Vector3d::Zero(), w_imu, C_imuend_ptr, nullptr, twist_angular_cov, *T_imu_child);
-      if (pose_scan_end_pub->get_subscription_count()) {
+      if (has_subs(pose_scan_end_pub)) {
         pose_scan_end_pub->publish(to_pose_stamped(s, imu_end_stamp, map_frame_id));
       }
       if (publish_pose_scanend_with_cov) {
@@ -621,7 +741,7 @@ void RvizViewer::publish_frame(const FrameTask& task) {
     }
     if (want_lidar_pose_scanend) {
       const auto s = make_body_state(T_world_imuend, Eigen::Vector3d::Zero(), w_imu, C_imuend_ptr, nullptr, twist_angular_cov, T_imu_lidar);
-      if (lidar_pose_scan_end_pub->get_subscription_count()) {
+      if (has_subs(lidar_pose_scan_end_pub)) {
         lidar_pose_scan_end_pub->publish(to_pose_stamped(s, imu_end_stamp, map_frame_id));
       }
       if (publish_lidar_pose_scanend_with_cov) {
@@ -631,7 +751,7 @@ void RvizViewer::publish_frame(const FrameTask& task) {
   }
 
   // --- IMU bias ---
-  if (corrected && (imu_bias_pub->get_subscription_count() || imu_bias_with_cov_pub->get_subscription_count())) {
+  if (corrected && (has_subs(imu_bias_pub) || has_subs(imu_bias_with_cov_pub))) {
     geometry_msgs::msg::TwistStamped bias;
     bias.header.stamp = stamp;
     bias.header.frame_id = imu_frame_id;
@@ -642,10 +762,10 @@ void RvizViewer::publish_frame(const FrameTask& task) {
     bias.twist.angular.y = new_frame->imu_bias(4);
     bias.twist.angular.z = new_frame->imu_bias(5);
 
-    if (imu_bias_pub->get_subscription_count()) {
+    if (has_subs(imu_bias_pub)) {
       imu_bias_pub->publish(bias);
     }
-    if (imu_bias_with_cov_pub->get_subscription_count()) {
+    if (has_subs(imu_bias_with_cov_pub)) {
       geometry_msgs::msg::TwistWithCovarianceStamped bias_with_cov;
       bias_with_cov.header = bias.header;
       bias_with_cov.twist.twist = bias.twist;
@@ -659,7 +779,7 @@ void RvizViewer::publish_frame(const FrameTask& task) {
 
   // --- Point clouds ---
   auto& points_pub = !corrected ? this->points_pub : this->points_corrected_pub;
-  if (points_pub->get_subscription_count()) {
+  if (has_subs(points_pub)) {
     // Publish points in their own coordinate frame
     std::string frame_id;
     switch (new_frame->frame_id) {
@@ -670,7 +790,7 @@ void RvizViewer::publish_frame(const FrameTask& task) {
         frame_id = imu_frame_id;
         break;
       case FrameID::WORLD:
-        frame_id = map_frame_id;
+        frame_id = odom_frame_id;  // GLIM's world frame is the odometry frame
         break;
     }
 
@@ -679,11 +799,12 @@ void RvizViewer::publish_frame(const FrameTask& task) {
   }
 
   auto& aligned_points_pub = !corrected ? this->aligned_points_pub : this->aligned_points_corrected_pub;
-  if (aligned_points_pub->get_subscription_count()) {
-    // Publish points aligned to the world frame to avoid some visualization issues in Rviz2
+  if (has_subs(aligned_points_pub)) {
+    // Publish points aligned to the map frame (odom -> map with the loop-closure correction)
+    const Eigen::Isometry3d T_map_sensor = T_world_odom * new_frame->T_world_sensor();
     std::vector<Eigen::Vector4d> transformed(new_frame->frame->size());
     for (int i = 0; i < new_frame->frame->size(); i++) {
-      transformed[i] = new_frame->T_world_sensor() * new_frame->frame->points[i];
+      transformed[i] = T_map_sensor * new_frame->frame->points[i];
     }
 
     gtsam_points::PointCloud frame;
@@ -723,7 +844,7 @@ void RvizViewer::globalmap_on_update_submaps(const std::vector<SubMap::Ptr>& sub
       this->submaps.push_back(latest_submap->frame);
     }
 
-    if (!map_pub->get_subscription_count()) {
+    if (!has_subs(map_pub)) {
       return;
     }
 

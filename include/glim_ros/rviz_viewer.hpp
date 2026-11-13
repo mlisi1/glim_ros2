@@ -10,9 +10,15 @@
 #include <condition_variable>
 
 #include <rclcpp/rclcpp.hpp>
+#if __has_include(<tf2_ros/buffer.hpp>)
+#include <tf2_ros/buffer.hpp>
+#include <tf2_ros/transform_listener.hpp>
+#include <tf2_ros/transform_broadcaster.hpp>
+#else
 #include <tf2_ros/buffer.h>
 #include <tf2_ros/transform_listener.h>
 #include <tf2_ros/transform_broadcaster.h>
+#endif
 
 #include <nav_msgs/msg/odometry.hpp>
 #include <geometry_msgs/msg/pose_stamped.hpp>
@@ -70,6 +76,7 @@ private:
   void resolve_frame_ids();
   std::optional<Eigen::Isometry3d> lookup_T_imu_base();
   void publish_frame(const FrameTask& task);
+  void publish_map_odom_periodic();
 
   bool should_warn(std::chrono::steady_clock::time_point& last, double period_sec);
 
@@ -106,6 +113,17 @@ private:
   bool publish_tf_odom_base;
   bool publish_tf_imu_lidar;
 
+  // map->odom computation
+  //  internal: relative to GLIM's own odometry frame (GLIM also owns odom->base)
+  //  external: relative to an odom->base transform published by someone else (e.g. robot_localization)
+  bool map_odom_external;
+  bool map_odom_planar;          // keep only x, y, yaw of map->odom
+  double map_odom_rate;          // [Hz] republish rate in external mode
+  double map_odom_tolerance;     // [s] future-dating of republished map->odom (as AMCL's transform_tolerance)
+  double external_odom_timeout;  // [s] max wait for the external odom->base at the scan stamp
+  std::optional<Eigen::Isometry3d> latest_T_map_odom;
+  rclcpp::Time last_map_odom_pub;
+
   // Odometry/pose output frame
   BodyFrame odom_child_frame;
   double twist_angular_cov;     // variance [rad^2/s^2] reported for angular velocity
@@ -115,6 +133,10 @@ private:
   std::mutex imu_mutex;
   std::deque<Eigen::Vector4d> gyro_buffer;
   std::optional<Eigen::Isometry3d> T_imu_base;  // cached static transform
+
+  // Publishers: nullptr if disabled through the 'outputs' parameter
+  std::shared_ptr<rclcpp::Publisher<nav_msgs::msg::Odometry>> odometry_local_pub;   // ~/odometry/local
+  std::shared_ptr<rclcpp::Publisher<nav_msgs::msg::Odometry>> odometry_global_pub;  // ~/odometry/global
 
   std::shared_ptr<rclcpp::Publisher<sensor_msgs::msg::PointCloud2>> map_pub;
 
