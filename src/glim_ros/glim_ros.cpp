@@ -220,8 +220,36 @@ GlimROS::GlimROS(const rclcpp::NodeOptions& options) : Node("glim_ros", options)
   qos = get_qos_settings(config_ros, "glim_ros", "points_qos", default_points_qos);
   points_sub = this->create_subscription<sensor_msgs::msg::PointCloud2>(points_topic, qos, std::bind(&GlimROS::points_callback, this, _1), points_options);
 #ifdef BUILD_WITH_CV_BRIDGE
-  qos = get_qos_settings(config_ros, "glim_ros", "image_qos");
-  image_sub = image_transport::create_subscription(this, image_topic, std::bind(&GlimROS::image_callback, this, _1), "raw", qos.get_rmw_qos_profile());
+  // Images are used only by some extension modules: an empty image_topic disables the subscription.
+  // image_transport subscribes to the base topic + transport; a transport-specific name (e.g. ".../compressed")
+  // is split into base topic and transport so that it works as before without image_transport's warning.
+  std::string image_base_topic = image_topic;
+  std::string image_transport_name = this->declare_parameter<std::string>("image_transport", "raw");
+  for (const std::string suffix : {"compressed", "compressedDepth", "theora", "zstd", "ffmpeg"}) {
+    const std::string tail = "/" + suffix;
+    if (image_base_topic.size() > tail.size() && image_base_topic.compare(image_base_topic.size() - tail.size(), tail.size(), tail) == 0) {
+      image_base_topic.resize(image_base_topic.size() - tail.size());
+      image_transport_name = suffix;
+      break;
+    }
+  }
+  if (image_base_topic.empty()) {
+    spdlog::info("image_topic is empty: not subscribing to images");
+  } else {
+    spdlog::info("subscribing to images: {} (transport: {})", image_base_topic, image_transport_name);
+    qos = get_qos_settings(config_ros, "glim_ros", "image_qos");
+    try {
+      image_sub = image_transport::create_subscription(
+        this,
+        image_base_topic,
+        std::bind(&GlimROS::image_callback, this, _1),
+        image_transport_name,
+        qos.get_rmw_qos_profile());
+    } catch (const std::exception& e) {
+      // e.g. the transport plugin is not installed: images are optional, keep running without them
+      spdlog::error("failed to subscribe to images ({} / {}): {}", image_base_topic, image_transport_name, e.what());
+    }
+  }
 #endif
 
   for (const auto& sub : this->extension_subscriptions()) {

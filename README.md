@@ -25,6 +25,7 @@ files keep working. The work happens on the `dev` branch.
 | Map | Full-resolution concatenation of all submaps every 10 s, built in the publishing thread | Per-submap voxelized cache, rebuilt with the current (loop-closed) poses only when changed, in its own thread |
 | Navigation map | None | `~/grid` 2D occupancy grid (`nav_msgs/OccupancyGrid`) |
 | Saving | Only at shutdown, to `/tmp/dump` | `~/save_map` service at any time: GLIM dump + `map.pcd` + `map.pgm`/`map.yaml` (nav2_map_server) |
+| Images | Always subscribed (with cv_bridge), raw transport only | Only if `image_topic` is non-empty; transport from `image_transport` or the topic suffix (`.../compressed`) |
 | Configuration | JSON files only | `config_ros.json` keys (topics, frames, offsets, modules...) can be overridden by ROS parameters; several parameters can be changed at runtime |
 | Covariances | All zeros unless GLIM's `compute_covs` is enabled; body-frame | Configurable fallbacks; pose covariance expressed about the parent frame's axes (REP-103/ROS convention) |
 | Execution | Single-threaded; point cloud preprocessing blocks IMU callbacks; 1 kHz polling timer | Multi-threaded executor with separate IMU / points / timer callback groups; 100 Hz timer |
@@ -110,7 +111,8 @@ false in this mode. `map_odom_planar:=true` keeps only x, y, yaw (useful with a 
 | Parameter | Default | Description |
 |---|---|---|
 | `config_path` | `config` | GLIM config directory (relative paths resolved against the `glim` package) |
-| `imu_topic`, `points_topic`, `image_topic` | from `config_ros.json` | Input topics |
+| `imu_topic`, `points_topic`, `image_topic` | from `config_ros.json` | Input topics (empty `image_topic`: no image subscription) |
+| `image_transport` | `raw` | image_transport plugin; overridden by a transport suffix in `image_topic` (`/compressed`, `/compressedDepth`, `/theora`, `/zstd`, `/ffmpeg`) |
 | `imu_frame_id`, `lidar_frame_id`, `base_frame_id`, `odom_frame_id`, `map_frame_id` | from `config_ros.json` | Frame IDs (IMU / LiDAR auto-detected when empty; base defaults to IMU) |
 | `imu_time_offset`, `points_time_offset`, `acc_scale`, `ang_scale`, `keep_raw_points` | from `config_ros.json` | Input corrections |
 | `enable_local_mapping`, `enable_global_mapping`, `extension_modules` | from `config_ros.json` | Pipeline composition |
