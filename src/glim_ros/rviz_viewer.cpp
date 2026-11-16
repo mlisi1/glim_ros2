@@ -290,14 +290,25 @@ std::vector<GenericTopicSubscription::Ptr> RvizViewer::create_subscriptions(rclc
     publish_tf_odom_base = false;
   }
 
+  const std::string anchor_frame = node.declare_parameter<std::string>("anchor_frame", "imu");
+  if (anchor_frame != "imu" && anchor_frame != "base") {
+    logger->error("unknown anchor_frame '{}' (expected imu|base). using imu", anchor_frame);
+  }
+  anchor_base = anchor_frame == "base";
+  if (!anchor_base) {
+    std::lock_guard<std::mutex> lock(anchor_mutex);
+    T_map_world = Eigen::Isometry3d::Identity();
+  }
+
   logger->info(
-    "TF: map->odom={} ({}{}) odom->base={} imu->lidar={} | odom_child_frame={}",
+    "TF: map->odom={} ({}{}) odom->base={} imu->lidar={} | odom_child_frame={} anchor_frame={}",
     publish_tf_map_odom.load(),
     map_odom_mode,
     map_odom_planar ? ", planar" : "",
     publish_tf_odom_base.load(),
     publish_tf_imu_lidar.load(),
-    child);
+    child,
+    anchor_base ? "base" : "imu");
 
   map_voxel_size = node.declare_parameter<double>("map_voxel_size", map_voxel_size);
   map_publish_period = node.declare_parameter<double>("map_publish_period", map_publish_period);
@@ -591,18 +602,74 @@ std::optional<Eigen::Isometry3d> RvizViewer::lookup_T_imu_base() {
   return T_imu_base;
 }
 
+std::optional<Eigen::Isometry3d> RvizViewer::get_anchor() {
+  std::lock_guard<std::mutex> lock(anchor_mutex);
+  return T_map_world;
+}
+
+// anchor_frame=base: the published map/odom frames start at the base pose of the first frame, reduced to x, y, z and
+// yaw. GLIM's world frame is gravity aligned and rotating only about z keeps it so (occupancy grid heights, gravity in
+// the IMU-rate propagation). The first frame is recorded even if imu->base is not known yet, so a late TF does not move
+// the origin; nothing is published until it is known.
+std::optional<Eigen::Isometry3d> RvizViewer::resolve_anchor(const Eigen::Isometry3d& T_world_imu) {
+  if (auto anchor = get_anchor()) {
+    return anchor;
+  }
+  if (!first_T_world_imu) {
+    first_T_world_imu = T_world_imu;
+  }
+  const auto T_imu_base = lookup_T_imu_base();
+  if (!T_imu_base) {
+    return std::nullopt;
+  }
+
+  const Eigen::Isometry3d T_world_base0 = (*first_T_world_imu) * (*T_imu_base);
+  const Eigen::Matrix3d R = T_world_base0.linear();
+  Eigen::Isometry3d T_world_map = Eigen::Isometry3d::Identity();
+  T_world_map.linear() = Eigen::AngleAxisd(std::atan2(R(1, 0), R(0, 0)), Eigen::Vector3d::UnitZ()).toRotationMatrix();
+  T_world_map.translation() = T_world_base0.translation();
+
+  std::lock_guard<std::mutex> lock(anchor_mutex);
+  T_map_world = T_world_map.inverse();
+  const Eigen::Vector3d t = T_world_map.translation();
+  logger->info(
+    "anchor_frame=base: {}/{} origin at the initial {} pose (GLIM world x={:.3f} y={:.3f} z={:.3f} yaw={:.3f})",
+    map_frame_id,
+    odom_frame_id,
+    base_frame_id,
+    t.x(),
+    t.y(),
+    t.z(),
+    std::atan2(R(1, 0), R(0, 0)));
+  return T_map_world;
+}
+
 void RvizViewer::publish_frame(const FrameTask& task) {
   const auto& new_frame = task.frame;
   const bool corrected = task.corrected;
 
   resolve_frame_ids();
 
-  const Eigen::Isometry3d T_odom_imu = new_frame->T_world_imu;
-  const Eigen::Vector3d v_odom_imu = new_frame->v_world_imu;
+  // Published frames = GLIM's frames re-anchored by A = T_map_world (identity for anchor_frame=imu):
+  //  odom->imu = A * T_odom_imu(GLIM), map->odom = A * T_world_odom(GLIM) * A^-1, hence map->imu = A * T_world_imu(GLIM)
+  const auto anchor = resolve_anchor(task.T_world_odom * new_frame->T_world_imu);
+  if (!anchor) {
+    static std::chrono::steady_clock::time_point last_warn;
+    if (should_warn(last_warn, 5.0)) {
+      logger->warn("anchor_frame=base: waiting for {} -> {} before publishing", imu_frame_id, base_frame_id);
+    }
+    return;
+  }
+  const Eigen::Isometry3d& A = *anchor;
+  const Eigen::Matrix3d R_A = A.linear();
+
+  const Eigen::Isometry3d T_odom_imu = A * new_frame->T_world_imu;
+  const Eigen::Vector3d v_odom_imu = R_A * new_frame->v_world_imu;
   const Eigen::Isometry3d T_lidar_imu = new_frame->T_lidar_imu;
   const Eigen::Isometry3d T_imu_lidar = T_lidar_imu.inverse();
 
-  const Eigen::Isometry3d T_world_odom = task.T_world_odom;
+  // "world" below is the published map frame
+  const Eigen::Isometry3d T_world_odom = A * task.T_world_odom * A.inverse();
   const Eigen::Isometry3d T_world_imu = T_world_odom * T_odom_imu;
 
   // Covariances (only available for optimized frames when enabled in GLIM)
@@ -610,7 +677,8 @@ void RvizViewer::publish_frame(const FrameTask& task) {
   gtsam::Matrix6 C_pose_fallback = gtsam::Matrix6::Zero();
   C_pose_fallback.diagonal() << Eigen::Vector3d::Constant(fallback_rotation_var), Eigen::Vector3d::Constant(fallback_position_var);
   const gtsam::Matrix6* C_pose = new_frame->cov_computed ? &new_frame->pose_cov : &C_pose_fallback;
-  const Eigen::Matrix3d C_vel_odom = new_frame->cov_computed ? Eigen::Matrix3d(new_frame->vel_cov) : Eigen::Matrix3d(fallback_velocity_var * Eigen::Matrix3d::Identity());
+  const Eigen::Matrix3d C_vel_glim = new_frame->cov_computed ? Eigen::Matrix3d(new_frame->vel_cov) : Eigen::Matrix3d(fallback_velocity_var * Eigen::Matrix3d::Identity());
+  const Eigen::Matrix3d C_vel_odom = R_A * C_vel_glim * R_A.transpose();
   const Eigen::Matrix3d* C_vel_odom_ptr = &C_vel_odom;
 
   if (corrected) {
@@ -875,14 +943,27 @@ void RvizViewer::publish_frame(const FrameTask& task) {
         break;
     }
 
-    auto points = frame_to_pointcloud2(frame_id, new_frame->stamp, *new_frame->frame);
-    points_pub->publish(*points);
+    if (new_frame->frame_id == FrameID::WORLD && !A.isApprox(Eigen::Isometry3d::Identity())) {
+      std::vector<Eigen::Vector4d> transformed(new_frame->frame->size());
+      for (int i = 0; i < new_frame->frame->size(); i++) {
+        transformed[i] = A * new_frame->frame->points[i];
+      }
+      gtsam_points::PointCloud frame;
+      frame.num_points = new_frame->frame->size();
+      frame.points = transformed.data();
+      frame.times = new_frame->frame->times;
+      frame.intensities = new_frame->frame->intensities;
+      points_pub->publish(*frame_to_pointcloud2(frame_id, new_frame->stamp, frame));
+    } else {
+      auto points = frame_to_pointcloud2(frame_id, new_frame->stamp, *new_frame->frame);
+      points_pub->publish(*points);
+    }
   }
 
   auto& aligned_points_pub = !corrected ? this->aligned_points_pub : this->aligned_points_corrected_pub;
   if (has_subs(aligned_points_pub)) {
     // Publish points aligned to the map frame (odom -> map with the loop-closure correction)
-    const Eigen::Isometry3d T_map_sensor = T_world_odom * new_frame->T_world_sensor();
+    const Eigen::Isometry3d T_map_sensor = T_world_odom * A * new_frame->T_world_sensor();
     std::vector<Eigen::Vector4d> transformed(new_frame->frame->size());
     for (int i = 0; i < new_frame->frame->size(); i++) {
       transformed[i] = T_map_sensor * new_frame->frame->points[i];
@@ -990,7 +1071,7 @@ rcl_interfaces::msg::SetParametersResult RvizViewer::on_set_parameters(const std
 
   static const std::set<std::string> restart_required = {
     "imu_frame_id", "lidar_frame_id", "base_frame_id", "odom_frame_id", "map_frame_id", "odom_child_frame", "outputs",
-    "map_odom_mode", "max_publish_queue", "map_voxel_size", "grid_resolution"};
+    "map_odom_mode", "anchor_frame", "max_publish_queue", "map_voxel_size", "grid_resolution"};
 
   bool grid_changed = false;
   for (const auto& p : params) {
@@ -1117,7 +1198,7 @@ RvizViewer::SubmapCache RvizViewer::make_submap_cache(const SubMap::ConstPtr& su
 }
 
 // Requires map_mutex
-gtsam_points::PointCloudCPU::Ptr RvizViewer::build_map() {
+gtsam_points::PointCloudCPU::Ptr RvizViewer::build_map(const Eigen::Isometry3d& anchor) {
   const size_t n = std::min(submap_caches.size(), submap_poses.size());
   size_t total = 0;
   for (size_t i = 0; i < n; i++) {
@@ -1128,8 +1209,9 @@ gtsam_points::PointCloudCPU::Ptr RvizViewer::build_map() {
   points.reserve(total);
   for (size_t i = 0; i < n; i++) {
     const auto& cloud = submap_caches[i].points;
+    const Eigen::Isometry3d T_map_submap = anchor * submap_poses[i];
     for (size_t j = 0; j < cloud->size(); j++) {
-      points.push_back(submap_poses[i] * cloud->points[j]);
+      points.push_back(T_map_submap * cloud->points[j]);
     }
   }
 
@@ -1139,10 +1221,15 @@ gtsam_points::PointCloudCPU::Ptr RvizViewer::build_map() {
 }
 
 // Requires map_mutex
-std::shared_ptr<nav_msgs::msg::OccupancyGrid> RvizViewer::build_grid() {
+std::shared_ptr<nav_msgs::msg::OccupancyGrid> RvizViewer::build_grid(const Eigen::Isometry3d& anchor) {
   const size_t n = std::min(submap_caches.size(), submap_poses.size());
   if (n == 0) {
     return nullptr;
+  }
+  // Submap poses in the published map frame (the anchor only rotates about z: heights stay comparable)
+  std::vector<Eigen::Isometry3d, Eigen::aligned_allocator<Eigen::Isometry3d>> poses(n);
+  for (size_t i = 0; i < n; i++) {
+    poses[i] = anchor * submap_poses[i];
   }
 
   // Bounds
@@ -1153,10 +1240,10 @@ std::shared_ptr<nav_msgs::msg::OccupancyGrid> RvizViewer::build_grid() {
     max_pt = max_pt.cwiseMax(p.head<2>());
   };
   for (size_t i = 0; i < n; i++) {
-    const Eigen::Vector3d o = submap_poses[i].translation();
+    const Eigen::Vector3d o = poses[i].translation();
     extend(o);
     for (const auto& p : submap_caches[i].grid_points) {
-      const Eigen::Vector3d w = submap_poses[i] * p;
+      const Eigen::Vector3d w = poses[i] * p;
       if ((w - o).head<2>().norm() <= grid_max_range) extend(w);
     }
   }
@@ -1199,7 +1286,7 @@ std::shared_ptr<nav_msgs::msg::OccupancyGrid> RvizViewer::build_grid() {
   };
 
   for (size_t i = 0; i < n; i++) {
-    const Eigen::Vector3d o = submap_poses[i].translation();
+    const Eigen::Vector3d o = poses[i].translation();
     const Eigen::Vector2i oc = to_cell(o);
     if (!inside(oc)) continue;
 
@@ -1212,7 +1299,7 @@ std::shared_ptr<nav_msgs::msg::OccupancyGrid> RvizViewer::build_grid() {
       return (static_cast<int64_t>(std::floor(w.y() / grid_ground_cell)) << 32) ^ (static_cast<int64_t>(std::floor(w.x() / grid_ground_cell)) & 0xffffffff);
     };
     for (const auto& p : submap_caches[i].grid_points) {
-      const Eigen::Vector3d w = submap_poses[i] * p;
+      const Eigen::Vector3d w = poses[i] * p;
       if ((w - o).head<2>().norm() > grid_max_range || !inside(to_cell(w))) continue;
       pts.push_back(w);
       auto found = ground.try_emplace(ground_key(w), static_cast<float>(w.z()));
@@ -1264,12 +1351,16 @@ void RvizViewer::publish_map_and_grid() {
   if (submap_caches.empty()) {
     return;
   }
+  const auto anchor = get_anchor();
+  if (!anchor) {
+    return;
+  }
   const rclcpp::Time now = clock->now();
 
   // Publish when changed (at most every map_publish_period) or when a new subscriber appears
   const size_t map_subs = map_pub ? map_pub->get_subscription_count() : 0;
   if (map_subs && ((map_dirty && (now - last_globalmap_pub_time).seconds() >= map_publish_period) || map_subs > last_map_subs)) {
-    auto map = build_map();
+    auto map = build_map(*anchor);
     map_pub->publish(*frame_to_pointcloud2(map_frame_id, now.seconds(), *map));
     last_globalmap_pub_time = now;
     map_dirty = false;
@@ -1279,7 +1370,7 @@ void RvizViewer::publish_map_and_grid() {
 
   const size_t grid_subs = grid_pub ? grid_pub->get_subscription_count() : 0;
   if (grid_subs && ((grid_dirty && (now - last_grid_pub_time).seconds() >= map_publish_period) || grid_subs > last_grid_subs)) {
-    auto grid = build_grid();
+    auto grid = build_grid(*anchor);
     if (grid) {
       grid_pub->publish(*grid);
       logger->debug("published grid ({}x{})", grid->info.width, grid->info.height);
@@ -1308,8 +1399,20 @@ void RvizViewer::at_exit(const std::string& dump_path) {
   }
   std::filesystem::create_directories(dump_path);
 
+  std::optional<Eigen::Isometry3d> anchor = get_anchor();
+  if (!anchor) {
+    logger->warn("anchor_frame=base: the anchor was never resolved ({} -> {} unknown); saving map.pcd/map.pgm in GLIM's world frame", imu_frame_id, base_frame_id);
+    anchor = Eigen::Isometry3d::Identity();
+  }
+  {
+    // GLIM's own dump (graph, submaps) stays in GLIM's world frame: record how map.pcd/map.pgm relate to it
+    std::ofstream ofs(dump_path + "/map_anchor.txt");
+    ofs << "# T_map_world: pose of GLIM's world frame in the frame of map.pcd / map.yaml (p_map = T_map_world * p_world)\n"
+        << std::setprecision(12) << anchor->matrix() << "\n";
+  }
+
   // Point cloud map (binary PCD)
-  const auto map = build_map();
+  const auto map = build_map(*anchor);
   {
     std::ofstream ofs(dump_path + "/map.pcd", std::ios::binary);
     ofs << "# .PCD v0.7 - Point Cloud Data file format\nVERSION 0.7\nFIELDS x y z\nSIZE 4 4 4\nTYPE F F F\nCOUNT 1 1 1\n"
@@ -1322,7 +1425,7 @@ void RvizViewer::at_exit(const std::string& dump_path) {
   logger->info("saved {} ({} points, {} submaps)", dump_path + "/map.pcd", map->size(), std::min(submap_caches.size(), submap_poses.size()));
 
   // Occupancy grid (nav2_map_server trinary format)
-  const auto grid = build_grid();
+  const auto grid = build_grid(*anchor);
   if (grid) {
     const int W = grid->info.width, H = grid->info.height;
     std::ofstream pgm(dump_path + "/map.pgm", std::ios::binary);

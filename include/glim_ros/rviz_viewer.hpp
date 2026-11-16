@@ -86,13 +86,15 @@ private:
   };
   void map_loop();
   SubmapCache make_submap_cache(const SubMap::ConstPtr& submap);
-  gtsam_points::PointCloudCPU::Ptr build_map();
-  std::shared_ptr<nav_msgs::msg::OccupancyGrid> build_grid();
+  gtsam_points::PointCloudCPU::Ptr build_map(const Eigen::Isometry3d& anchor);
+  std::shared_ptr<nav_msgs::msg::OccupancyGrid> build_grid(const Eigen::Isometry3d& anchor);
   void publish_map_and_grid();
 
   void worker_loop();
   void resolve_frame_ids();
   std::optional<Eigen::Isometry3d> lookup_T_imu_base();
+  std::optional<Eigen::Isometry3d> resolve_anchor(const Eigen::Isometry3d& T_world_imu);
+  std::optional<Eigen::Isometry3d> get_anchor();
   void publish_frame(const FrameTask& task);
   void publish_map_odom_periodic();
   void check_imu_lidar_tf();
@@ -174,6 +176,14 @@ private:
   bool imu_lidar_checked = false;
   std::atomic_bool imu_lidar_refused{false};  // LiDAR frame has another parent in TF
   rclcpp::node_interfaces::OnSetParametersCallbackHandle::SharedPtr param_callback;
+  // Anchor of the published map/odom frames w.r.t. GLIM's world frame (left correction of every output).
+  //  imu : identity (upstream: origin at the IMU pose at initialization)
+  //  base: inverse of the initial base pose reduced to x, y, z, yaw (keeps the frames gravity aligned)
+  bool anchor_base = false;
+  std::optional<Eigen::Isometry3d> first_T_world_imu;  // worker thread only
+  std::mutex anchor_mutex;
+  std::optional<Eigen::Isometry3d> T_map_world;  // set once; nullopt until resolved
+
   std::mutex T_imu_base_mutex;
   std::optional<Eigen::Isometry3d> T_imu_base;  // cached static transform
 

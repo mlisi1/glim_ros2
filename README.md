@@ -17,6 +17,7 @@ files keep working. The work happens on the `dev` branch.
 | TF | Always on (only `imu->lidar` configurable); `imu->lidar` carries the inverse transform | Per-edge switches as ROS parameters; one TF per scan, from the optimized estimate; `imu->lidar` fixed |
 | `map->odom` | Only relative to GLIM's own odometry, so GLIM must own the whole tree | `map_odom_mode:=external`: `map->odom` computed against an external `odom->base` (e.g. robot_localization), like AMCL / slam_toolbox |
 | `nav_msgs/Odometry` twist | World-frame velocity labelled as body frame; angular velocity always 0 | Twist in `child_frame_id` (with lever arm); angular velocity = bias-corrected gyro |
+| Frame origin | `map`/`odom` start at the IMU pose at initialization (offset by the IMU lever arm from `base_link`) | `anchor_frame:=base`: `map`/`odom` start at the initial base pose (x, y, z, yaw), as AMCL / slam_toolbox |
 | Odometry child frame | Always the IMU frame | `odom_child_frame`: `imu`, `lidar` or `base` (poses, twists and covariances transformed) |
 | Outputs | ~30 publishers always created | `outputs` parameter selects which topics exist |
 | Topic naming | `odom_corrected` means "optimized", not "loop-closure corrected" | Added `~/odometry/local` and `~/odometry/global` with explicit semantics |
@@ -86,6 +87,14 @@ files keep working. The work happens on the `dev` branch.
 
 * `odom` (`odom_frame_id`): GLIM's odometry frame — smooth, drifts.
 * `map` (`map_frame_id`): loop-closure-corrected frame. `T_map_body = T_map_odom * T_odom_body`.
+* origin (`anchor_frame`): GLIM's world frame is gravity aligned with its origin at the IMU at
+  initialization. With `anchor_frame:=imu` (default, upstream) `map` and `odom` are that frame, so with the
+  robot at rest `map -> base_link` starts at the IMU -> base lever arm. With `anchor_frame:=base` every
+  output (TF, `odom*`, `pose*`, `odometry/*`, clouds, `~/map`, `~/grid`, `map.pcd`, `map.yaml`) is
+  re-anchored by `A = T_world_base0^-1`, where `T_world_base0` is the base pose of the first frame reduced
+  to x, y, z and yaw (so the frames stay gravity aligned): `map -> base_link` starts at (0, 0, 0, yaw 0)
+  up to the base's own roll/pitch. Outputs wait until `imu -> base` is in TF. GLIM's own dump stays in its
+  world frame; `map_anchor.txt` in the saved directory holds `A`.
 * body frames: `imu_frame_id`, `lidar_frame_id`, `base_frame_id` (from `config_ros.json`; IMU / LiDAR
   are auto-detected from the message headers when empty). `imu -> base` is looked up once from TF
   (normally `robot_state_publisher` / URDF) and cached.
@@ -127,6 +136,7 @@ false in this mode. `map_odom_planar:=true` keeps only x, y, yaw (useful with a 
 | `map_odom_rate` | `20.0` | [Hz] `map -> odom` republish rate (external mode) |
 | `map_odom_tolerance` | `0.1` | [s] future-dating of the republished `map -> odom` |
 | `external_odom_timeout` | `0.1` | [s] wait for the external `odom -> base` at the scan stamp |
+| `anchor_frame` | `imu` | Origin of `map` / `odom`: `imu` (upstream) or `base` (initial base pose, see Frames) |
 | `odom_child_frame` | `imu` | Body frame of `odom*`, `pose*`, `odometry/*`: `imu`, `lidar`, `base` |
 | `twist_angular_window` | `0.1` | [s] gyro averaging window around the scan stamp |
 | `twist_angular_cov` | `0.01` | [rad²/s²] variance reported for the angular velocity |
@@ -150,7 +160,7 @@ QoS profiles and the GLIM algorithm parameters stay in the JSON files of `config
 **Runtime changes** (`ros2 param set /glim_ros <name> <value>`): `publish_tf*`, `tf_time_offset`,
 `map_odom_planar`, `map_odom_rate`, `map_odom_tolerance`, `external_odom_timeout`, `twist_angular_*`,
 `fallback_*_var`, `map_publish_period`, `grid_z_min`, `grid_z_max`, `grid_min_points`, `grid_max_range`,
-`grid_ground_cell`. Frame IDs, `odom_child_frame`, `outputs`, `map_odom_mode`, `map_voxel_size` and
+`grid_ground_cell`. Frame IDs, `odom_child_frame`, `anchor_frame`, `outputs`, `map_odom_mode`, `map_voxel_size` and
 `grid_resolution` are rejected at runtime (restart required); the others are read at startup.
 
 ## Topics (all under the node namespace, `/glim_ros/...` by default)
@@ -194,6 +204,7 @@ Node(
         'map_odom_mode': 'external',      # EKF owns odom -> base_link, GLIM owns map -> odom
         'map_odom_planar': True,          # 2D EKF / Nav2
         'odom_child_frame': 'base',       # odometry expressed in base_link
+        'anchor_frame': 'base',           # map / odom origin at the initial base_link pose
         'outputs': ['odometry/local', 'odometry/global', 'grid'],
         'map_save_directory': '~/glim_maps',
     }],
