@@ -204,8 +204,16 @@ and in the EKF: `odom0: /glim_ros/odometry/local`, `world_frame: odom`, `publish
 
 Same as upstream (see the [GLIM docs](https://koide3.github.io/glim/)), plus the ROS packages
 `std_srvs`, `diagnostic_updater` and `diagnostic_msgs` (`rosdep install --from-paths src -y`).
-Requires a GLIM version that provides frame covariances (`EstimationFrame::pose_cov`,
-koide3/glim ≥ 1a197c9, Oct 2026); older GLIM commits (e.g. a9be365) do not compile.
+
+GLIM must provide frame covariances (`EstimationFrame::pose_cov`, added in koide3/glim `d0eeebe`,
+included in v1.2.2); older commits such as `a9be365` do not compile. Tested with GLIM `1a197c9`
+(Oct 2026), which also brings robust initial state estimation, a fix for crashes after long
+interruptions and a fmt ≥ 11 build fix. Building v1.2.2 itself has not been tested.
+
+Note on gtsam_points: GLIM master's GPU odometry (`odometry_estimation_gpu.cpp`) uses
+`IndexedSlidingWindow::has_index()`, which is newer than gtsam_points 1.2.2 (the latest PPA package).
+A CPU-only build works with the PPA's `libgtsam-points-dev` 1.2.2; a CUDA build of GLIM master needs
+gtsam_points built from source (a commit that has `has_index`).
 
 ## Known limitations
 
