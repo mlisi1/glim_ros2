@@ -789,7 +789,7 @@ void RvizViewer::publish_frame(const FrameTask& task) {
     }
   }
 
-  // Isolated zero-duration frames are normal (Velodyne bag: ~1 in 4, at most 5 in a row): warn only when it
+  // Isolated zero-duration frames are normal (Velodyne bag: 1 of 364 frames): warn only when it
   // persists, i.e. *_scanend equals the scan pose for many consecutive frames (e.g. global_shutter_lidar true)
   if (!corrected) {
     scanend_short_frames = std::abs(imu_end_time - new_frame->stamp) < 1e-3 ? scanend_short_frames + 1 : 0;

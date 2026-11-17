@@ -236,8 +236,8 @@ gtsam_points built from source (a commit that has `has_index`).
   the *end* of the sweep (e.g. the Velodyne driver, per-point times ≈ −0.1…0 s) are fine: GLIM detects the
   negative times and moves the frame stamp to the first point (measured on a Velodyne bag: 0.10 s scans).
   With `global_shutter_lidar: true` every scan has zero duration: no deskewing, and `*_scanend` equals the
-  scan pose. The node warns after 10 consecutive zero-duration frames; isolated ones are normal (about 1 in 4
-  on the Velodyne bag, never more than 5 in a row) and not reported.
+  scan pose. The node warns after 10 consecutive zero-duration frames; isolated ones are normal (1 of 364 frames
+  on the Velodyne bag) and not reported.
 * `odometry/imu_rate` propagates GLIM's velocity estimate between scans, so its error grows with the
   velocity error; prefer `odometry/local` as an EKF input unless the velocity estimate is good.
 * The occupancy grid is a 2.5D height-band heuristic (good for static maps, not a costmap); tall
