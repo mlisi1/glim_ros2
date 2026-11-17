@@ -17,7 +17,7 @@
 #include <rosbag2_compression/sequential_compression_reader.hpp>
 #include <rosbag2_storage/storage_filter.hpp>
 #include <rosbag2_storage/metadata_io.hpp>
-#include <ament_index_cpp/get_package_share_directory.hpp>
+#include <glim_ros/package_share.hpp>
 
 #include <glim/util/config.hpp>
 #include <glim/util/extension_module_ros2.hpp>
@@ -147,6 +147,9 @@ int main(int argc, char** argv) {
   rclcpp::init(argc, argv);
   rclcpp::NodeOptions options;
   auto glim = std::make_shared<glim::GlimROS>(options);
+  // rclcpp::spin_some(node) is deprecated on newer distros: one executor for the whole run (same callbacks)
+  rclcpp::executors::SingleThreadedExecutor executor;
+  executor.add_node(glim);
 
   // List topics
   glim::Config config_ros(glim::GlobalConfig::get_config_path("config_ros"));
@@ -290,7 +293,7 @@ int main(int argc, char** argv) {
       if (!rclcpp::ok()) {
         return false;
       }
-      rclcpp::spin_some(glim);
+      executor.spin_some();
 
       const auto msg = reader.read_next();
       const std::string topic_type = topic_type_map[msg->topic_name];
@@ -331,7 +334,7 @@ int main(int argc, char** argv) {
       if (keyboard.is_paused()) {
         auto pause_start = std::chrono::system_clock::now();
         while (keyboard.is_paused() && rclcpp::ok()) {
-          rclcpp::spin_some(glim);
+          executor.spin_some();
           std::this_thread::sleep_for(std::chrono::milliseconds(50));
           keyboard.update();
         }
@@ -410,7 +413,7 @@ int main(int argc, char** argv) {
 
       const auto t0 = std::chrono::high_resolution_clock::now();
       while (glim->needs_wait() && rclcpp::ok()) {
-        rclcpp::spin_some(glim);
+        executor.spin_some();
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
         spdlog::debug("throttling (waiting for odometry estimation)");
         if (std::chrono::high_resolution_clock::now() - t0 > std::chrono::seconds(1)) {

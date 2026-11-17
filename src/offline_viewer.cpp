@@ -3,7 +3,7 @@
 #include <spdlog/sinks/basic_file_sink.h>
 #include <spdlog/sinks/stdout_color_sinks.h>
 #include <boost/program_options.hpp>
-#include <ament_index_cpp/get_package_share_directory.hpp>
+#include <glim_ros/package_share.hpp>
 
 #include <glim/util/config.hpp>
 #include <glim/util/logging.hpp>
@@ -45,7 +45,7 @@ int main(int argc, char** argv) {
   std::string config_path = vm["config_path"].as<std::string>();
   if (config_path[0] != '/') {
     // config_path is relative to the glim directory
-    config_path = ament_index_cpp::get_package_share_directory("glim") + "/" + config_path;
+    config_path = glim::package_share_directory("glim") + "/" + config_path;
   }
 
   spdlog::info("config_path: {}", config_path);

@@ -17,7 +17,7 @@
 #include <rclcpp/rclcpp.hpp>
 #include <rclcpp_components/register_node_macro.hpp>
 #include <ament_index_cpp/get_package_prefix.hpp>
-#include <ament_index_cpp/get_package_share_directory.hpp>
+#include <glim_ros/package_share.hpp>
 
 #include <sensor_msgs/msg/imu.hpp>
 #include <sensor_msgs/msg/image.hpp>
@@ -85,7 +85,7 @@ GlimROS::GlimROS(const rclcpp::NodeOptions& options) : Node("glim_ros", options)
 
   if (config_path[0] != '/') {
     // config_path is relative to the glim directory
-    config_path = ament_index_cpp::get_package_share_directory("glim") + "/" + config_path;
+    config_path = glim::package_share_directory("glim") + "/" + config_path;
   }
 
   logger->info("config_path: {}", config_path);
@@ -164,7 +164,7 @@ GlimROS::GlimROS(const rclcpp::NodeOptions& options) : Node("glim_ros", options)
         spdlog::warn("You must carefully check and follow the licenses of ext modules");
 
         try {
-          const std::string config_ext_path = ament_index_cpp::get_package_share_directory("glim_ext") + "/config";
+          const std::string config_ext_path = glim::package_share_directory("glim_ext") + "/config";
           spdlog::info("config_ext_path: {}", config_ext_path);
           glim::GlobalConfig::instance()->override_param<std::string>("global", "config_ext", config_ext_path);
         } catch (ament_index_cpp::PackageNotFoundError& e) {
