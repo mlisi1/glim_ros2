@@ -232,10 +232,12 @@ gtsam_points built from source (a commit that has `has_index`).
 
 * **No localization-only mode** (load a saved map, relocalize, `/initialpose`). It needs changes inside
   GLIM's mapping modules, not only in this ROS interface, so it is out of scope for this fork.
-* **Per-point LiDAR timestamps matter.** Drivers that stamp a cloud at the *end* of the sweep (e.g. the
-  Velodyne driver, per-point times ≈ −0.1…0 s) make GLIM see a ~0 s scan unless the per-point time
-  settings in `config_sensors.json` are adjusted: deskewing is then effectively disabled,
-  `*_scanend` topics equal the scan pose, and odometry/velocity are noisier.
+* **Per-point LiDAR timestamps are needed for deskewing and the `*_scanend` outputs.** Clouds stamped at
+  the *end* of the sweep (e.g. the Velodyne driver, per-point times ≈ −0.1…0 s) are fine: GLIM detects the
+  negative times and moves the frame stamp to the first point (measured on a Velodyne bag: 0.10 s scans).
+  With `global_shutter_lidar: true` every scan has zero duration: no deskewing, and `*_scanend` equals the
+  scan pose. The node warns after 10 consecutive zero-duration frames; isolated ones are normal (about 1 in 4
+  on the Velodyne bag, never more than 5 in a row) and not reported.
 * `odometry/imu_rate` propagates GLIM's velocity estimate between scans, so its error grows with the
   velocity error; prefer `odometry/local` as an EKF input unless the velocity estimate is good.
 * The occupancy grid is a 2.5D height-band heuristic (good for static maps, not a costmap); tall

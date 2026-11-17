@@ -113,6 +113,7 @@ private:
   size_t max_frame_queue;
   std::chrono::steady_clock::time_point last_drop_warn;
   std::chrono::steady_clock::time_point last_scanend_warn;
+  int scanend_short_frames = 0;  // consecutive odometry frames whose scan end equals the frame time (publish thread only)
 
   rclcpp::Clock::SharedPtr clock;
   std::unique_ptr<tf2_ros::Buffer> tf_buffer;

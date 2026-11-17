@@ -789,10 +789,15 @@ void RvizViewer::publish_frame(const FrameTask& task) {
     }
   }
 
+  // Isolated zero-duration frames are normal (Velodyne bag: ~1 in 4, at most 5 in a row): warn only when it
+  // persists, i.e. *_scanend equals the scan pose for many consecutive frames (e.g. global_shutter_lidar true)
+  if (!corrected) {
+    scanend_short_frames = std::abs(imu_end_time - new_frame->stamp) < 1e-3 ? scanend_short_frames + 1 : 0;
+  }
   const auto warn_scanend = [&] {
-    if (std::abs(imu_end_time - new_frame->stamp) < 1e-3 && should_warn(last_scanend_warn, 10.0)) {
-      logger->warn("Scan end time is too close to the frame time (imu_end_time={}, frame_time={})", imu_end_time, new_frame->stamp);
-      logger->warn("Possibly due to the lack of IMU data");
+    if (scanend_short_frames >= 10 && should_warn(last_scanend_warn, 10.0)) {
+      logger->warn("Scan end time equals the frame time for {} consecutive frames (imu_end_time={}, frame_time={})", scanend_short_frames, imu_end_time, new_frame->stamp);
+      logger->warn("*_scanend outputs equal the scan pose and points are not deskewed: check global_shutter_lidar, per-point times and IMU data");
     }
   };
 

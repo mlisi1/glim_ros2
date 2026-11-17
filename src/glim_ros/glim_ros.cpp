@@ -239,12 +239,12 @@ GlimROS::GlimROS(const rclcpp::NodeOptions& options) : Node("glim_ros", options)
     spdlog::info("subscribing to images: {} (transport: {})", image_base_topic, image_transport_name);
     qos = get_qos_settings(config_ros, "glim_ros", "image_qos");
     try {
-      image_sub = image_transport::create_subscription(
-        this,
-        image_base_topic,
-        std::bind(&GlimROS::image_callback, this, _1),
-        image_transport_name,
-        qos.get_rmw_qos_profile());
+#if __has_include(<image_transport/node_interfaces.hpp>)
+      // image_transport >= 6 (Kilted and later): the rclcpp::Node* / rmw_qos_profile_t overload is deprecated
+      image_sub = image_transport::create_subscription(*this, image_base_topic, std::bind(&GlimROS::image_callback, this, _1), image_transport_name, qos);
+#else
+      image_sub = image_transport::create_subscription(this, image_base_topic, std::bind(&GlimROS::image_callback, this, _1), image_transport_name, qos.get_rmw_qos_profile());
+#endif
     } catch (const std::exception& e) {
       // e.g. the transport plugin is not installed: images are optional, keep running without them
       spdlog::error("failed to subscribe to images ({} / {}): {}", image_base_topic, image_transport_name, e.what());
