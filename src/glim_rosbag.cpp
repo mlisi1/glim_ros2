@@ -17,6 +17,12 @@
 #include <rosbag2_compression/sequential_compression_reader.hpp>
 #include <rosbag2_storage/storage_filter.hpp>
 #include <rosbag2_storage/metadata_io.hpp>
+#include <tf2_msgs/msg/tf_message.hpp>
+#if __has_include(<tf2_ros/static_transform_broadcaster.hpp>)
+#include <tf2_ros/static_transform_broadcaster.hpp>
+#else
+#include <tf2_ros/static_transform_broadcaster.h>
+#endif
 #include <glim_ros/package_share.hpp>
 
 #include <glim/util/config.hpp>
@@ -230,9 +236,8 @@ int main(int argc, char** argv) {
   // Keyboard handler for pause/resume
   KeyboardHandler keyboard;
 
-  // Bag read function
-  const auto read_bag = [&](const std::string& bag_filename) {
-    spdlog::info("opening {}", bag_filename);
+  // Open a bag (storage and compression detection)
+  const auto open_bag = [&](const std::string& bag_filename) {
     rosbag2_storage::StorageOptions options;
     options.uri = bag_filename;
 
@@ -272,7 +277,46 @@ int main(int argc, char** argv) {
       reader_ = std::make_unique<rosbag2_compression::SequentialCompressionReader>();
       reader_->open(options, converter_options);
     }
+    return reader_;
+  };
 
+  // The bags' /tf_static is not otherwise visible to the node (frames such as imu->base_link are needed by
+  // base_frame_id / odom_child_frame:=base / anchor_frame:=base): read it before playback (start_offset could
+  // seek past it) and broadcast it once (latched)
+  bool tf_static_from_bag = true;
+  glim->declare_parameter<bool>("tf_static_from_bag", tf_static_from_bag);
+  glim->get_parameter<bool>("tf_static_from_bag", tf_static_from_bag);
+  std::shared_ptr<tf2_ros::StaticTransformBroadcaster> tf_static_broadcaster;
+
+  const auto publish_tf_static = [&](const std::string& bag_filename) {
+    auto reader_ = open_bag(bag_filename);
+    rosbag2_storage::StorageFilter tf_filter;
+    tf_filter.topics.push_back("/tf_static");
+    reader_->set_filter(tf_filter);
+
+    rclcpp::Serialization<tf2_msgs::msg::TFMessage> tf_serialization;
+    std::vector<geometry_msgs::msg::TransformStamped> transforms;
+    while (reader_->has_next()) {
+      const auto msg = reader_->read_next();
+      const rclcpp::SerializedMessage serialized_msg(*msg->serialized_data);
+      tf2_msgs::msg::TFMessage tf_msg;
+      tf_serialization.deserialize_message(&serialized_msg, &tf_msg);
+      transforms.insert(transforms.end(), tf_msg.transforms.begin(), tf_msg.transforms.end());
+    }
+    if (transforms.empty()) {
+      return;
+    }
+    if (!tf_static_broadcaster) {
+      tf_static_broadcaster = std::make_shared<tf2_ros::StaticTransformBroadcaster>(glim);
+    }
+    spdlog::info("publishing {} static transforms from {}", transforms.size(), bag_filename);
+    tf_static_broadcaster->sendTransform(transforms);  // the broadcaster keeps (and merges) all frames sent so far
+  };
+
+  // Bag read function
+  const auto read_bag = [&](const std::string& bag_filename) {
+    spdlog::info("opening {}", bag_filename);
+    auto reader_ = open_bag(bag_filename);
     auto& reader = *reader_;
     reader.set_filter(filter);
 
@@ -432,6 +476,16 @@ int main(int argc, char** argv) {
   glim->get_parameter<bool>("auto_quit", auto_quit);
 
   const std::string dump_path = glim->get_parameter("dump_path").as_string();
+
+  if (tf_static_from_bag) {
+    for (const auto& bag_filename : bag_filenames) {
+      try {
+        publish_tf_static(bag_filename);
+      } catch (const std::exception& e) {
+        spdlog::warn("failed to read /tf_static from {}: {}", bag_filename, e.what());
+      }
+    }
+  }
 
   for (const auto& bag_filename : bag_filenames) {
     if (!read_bag(bag_filename)) {

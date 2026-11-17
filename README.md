@@ -97,7 +97,7 @@ files keep working. The work happens on the `dev` branch.
   world frame; `map_anchor.txt` in the saved directory holds `A`.
 * body frames: `imu_frame_id`, `lidar_frame_id`, `base_frame_id` (from `config_ros.json`; IMU / LiDAR
   are auto-detected from the message headers when empty). `imu -> base` is looked up once from TF
-  (normally `robot_state_publisher` / URDF) and cached.
+  (normally `robot_state_publisher` / URDF; `glim_rosbag` publishes the bags' `/tf_static`) and cached.
 
 ### TF modes
 
@@ -154,6 +154,7 @@ false in this mode. `map_odom_planar:=true` keeps only x, y, yaw (useful with a 
 | `grid_max_range` | `30.0` | [m] maximum range used for obstacles and free-space carving |
 | `debug`, `dump_on_unload`, `dump_path` | | As upstream |
 | `debug_log_path` | `/tmp/glim_log.log` | Log file when `debug` is true |
+| `tf_static_from_bag` | `true` | `glim_rosbag` only: publish the bags' `/tf_static` before playback (needed for `base_frame_id`, `odom_child_frame:=base`, `anchor_frame:=base`) |
 
 QoS profiles and the GLIM algorithm parameters stay in the JSON files of `config_path`.
 
