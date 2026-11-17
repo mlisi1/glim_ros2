@@ -21,7 +21,7 @@ files keep working. The work happens on the `dev` branch.
 | Odometry child frame | Always the IMU frame | `odom_child_frame`: `imu`, `lidar` or `base` (poses, twists and covariances transformed) |
 | Outputs | ~30 publishers always created | `outputs` parameter selects which topics exist |
 | Topic naming | `odom_corrected` means "optimized", not "loop-closure corrected" | Added `~/odometry/local` and `~/odometry/global` with explicit semantics |
-| Viewer | Closing a viewer window shuts the whole node down | SLAM keeps running (`shutdown_on_extension_exit`) |
+| Viewer | Closing a viewer window shuts the whole node down | SLAM keeps running (`shutdown_on_extension_exit`); GLIM's window itself stays open (see limitations) |
 | Clouds | `aligned_points` in GLIM's odom frame but labelled `map` | Transformed into `map` |
 | Map | Full-resolution concatenation of all submaps every 10 s, built in the publishing thread | Per-submap voxelized cache, rebuilt with the current (loop-closed) poses only when changed, in its own thread |
 | Navigation map | None | `~/grid` 2D occupancy grid (`nav_msgs/OccupancyGrid`) |
@@ -239,6 +239,10 @@ gtsam_points built from source (a commit that has `has_index`).
   With `global_shutter_lidar: true` every scan has zero duration: no deskewing, and `*_scanend` equals the
   scan pose. The node warns after 10 consecutive zero-duration frames; isolated ones are normal (1 of 364 frames
   on the Velodyne bag) and not reported.
+* Closing GLIM's GUI viewer window (`libstandard_viewer.so`) does not make it disappear: GLIM's viewer only
+  flags the request and keeps drawing until it is destroyed, and it cannot be unloaded while SLAM runs (its
+  callbacks into GLIM are never removed). The node logs the request and keeps running; the window goes
+  away at shutdown. Use `shutdown_on_extension_exit:=true` for upstream's close-to-quit behavior.
 * `odometry/imu_rate` propagates GLIM's velocity estimate between scans, so its error grows with the
   velocity error; prefer `odometry/local` as an EKF input unless the velocity estimate is good.
 * The occupancy grid is a 2.5D height-band heuristic (good for static maps, not a costmap); tall
