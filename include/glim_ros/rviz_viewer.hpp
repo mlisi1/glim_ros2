@@ -165,6 +165,8 @@ private:
     Eigen::Vector3d v_odom_imu;
     Eigen::Matrix<double, 6, 1> bias;  // [acc; gyro]
     Eigen::Isometry3d T_lidar_imu;
+    Eigen::Matrix<double, 6, 6> pose_cov;  // IMU pose covariance (GTSAM order, body frame): GLIM's or the fallback
+    Eigen::Matrix3d vel_cov;               // IMU velocity covariance in the odom frame
   };
   std::optional<ImuState> latest_state;
   double last_imu_rate_stamp = 0.0;

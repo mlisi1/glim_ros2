@@ -38,6 +38,13 @@ RowMajor6 reorder_cov(const gtsam::Matrix6& C) {
   return cov;
 }
 
+// Pose covariance (GTSAM order, body frame) of T * T_rel, given that of T and taking T_rel as exact
+// (the motion during the scan, or the IMU propagation since the last optimized state)
+gtsam::Matrix6 cov_after(const gtsam::Matrix6& C, const Eigen::Isometry3d& T_rel) {
+  const gtsam::Matrix6 Ad = gtsam::Pose3(T_rel.inverse().matrix()).AdjointMap();
+  return Ad * C * Ad.transpose();
+}
+
 geometry_msgs::msg::Pose to_pose_msg(const Eigen::Isometry3d& T) {
   const Eigen::Quaterniond q(T.linear());
   geometry_msgs::msg::Pose pose;
@@ -672,7 +679,6 @@ void RvizViewer::publish_frame(const FrameTask& task) {
   const Eigen::Isometry3d T_world_odom = A * task.T_world_odom * A.inverse();
   const Eigen::Isometry3d T_world_imu = T_world_odom * T_odom_imu;
 
-  // Covariances (only available for optimized frames when enabled in GLIM)
   // Covariances: GLIM's when computed (compute_covs), otherwise configurable fallbacks (never all-zero)
   gtsam::Matrix6 C_pose_fallback = gtsam::Matrix6::Zero();
   C_pose_fallback.diagonal() << Eigen::Vector3d::Constant(fallback_rotation_var), Eigen::Vector3d::Constant(fallback_position_var);
@@ -682,7 +688,7 @@ void RvizViewer::publish_frame(const FrameTask& task) {
   const Eigen::Matrix3d* C_vel_odom_ptr = &C_vel_odom;
 
   if (corrected) {
-    latest_state = ImuState{new_frame->stamp, T_odom_imu, v_odom_imu, new_frame->imu_bias, T_lidar_imu};
+    latest_state = ImuState{new_frame->stamp, T_odom_imu, v_odom_imu, new_frame->imu_bias, T_lidar_imu, *C_pose, C_vel_odom};
   }
 
   // Angular velocity: bias-corrected gyro averaged around the frame stamp (IMU frame)
@@ -830,12 +836,13 @@ void RvizViewer::publish_frame(const FrameTask& task) {
   if ((T_imu_child && has_subs(odom_scan_end_pub)) || has_subs(lidar_odom_scan_end_pub)) {
     warn_scanend();
     const Eigen::Isometry3d T_odom_imuend = T_odom_imu * T_imubegin_imuend;
+    const gtsam::Matrix6 C_imuend = cov_after(*C_pose, T_imubegin_imuend);
     if (T_imu_child && has_subs(odom_scan_end_pub)) {
-      const auto s = make_body_state(T_odom_imuend, v_odom_imu, w_imu, nullptr, nullptr, twist_angular_cov, *T_imu_child);
+      const auto s = make_body_state(T_odom_imuend, v_odom_imu, w_imu, &C_imuend, C_vel_odom_ptr, twist_angular_cov, *T_imu_child);
       odom_scan_end_pub->publish(to_odom_msg(s, imu_end_stamp, odom_frame_id, child_frame_id));
     }
     if (has_subs(lidar_odom_scan_end_pub)) {
-      const auto s = make_body_state(T_odom_imuend, v_odom_imu, w_imu, nullptr, nullptr, twist_angular_cov, T_imu_lidar);
+      const auto s = make_body_state(T_odom_imuend, v_odom_imu, w_imu, &C_imuend, C_vel_odom_ptr, twist_angular_cov, T_imu_lidar);
       lidar_odom_scan_end_pub->publish(to_odom_msg(s, imu_end_stamp, odom_frame_id, lidar_frame_id));
     }
   }
@@ -877,12 +884,8 @@ void RvizViewer::publish_frame(const FrameTask& task) {
     const Eigen::Isometry3d T_world_imuend = T_world_imu * T_imubegin_imuend;
 
     // Transform the covariance to the scan-end pose (T_world_imuend = T_world_imu * T_imubegin_imuend)
-    gtsam::Matrix6 C_imuend;
-    if (C_pose) {
-      const gtsam::Matrix6 Ad_T_imuend_imubegin = gtsam::Pose3(T_imubegin_imuend.inverse().matrix()).AdjointMap();
-      C_imuend = Ad_T_imuend_imubegin * (*C_pose) * Ad_T_imuend_imubegin.transpose();
-    }
-    const gtsam::Matrix6* C_imuend_ptr = C_pose ? &C_imuend : nullptr;
+    const gtsam::Matrix6 C_imuend = cov_after(*C_pose, T_imubegin_imuend);
+    const gtsam::Matrix6* C_imuend_ptr = &C_imuend;
 
     if (want_pose_scanend) {
       const auto s = make_body_state(T_world_imuend, Eigen::Vector3d::Zero(), w_imu, C_imuend_ptr, nullptr, twist_angular_cov, *T_imu_child);
@@ -1065,8 +1068,10 @@ void RvizViewer::publish_imu_rate() {
   Eigen::Isometry3d T = Eigen::Isometry3d::Identity();
   T.linear() = Eigen::Quaterniond(R).normalized().toRotationMatrix();
   T.translation() = p;
-  const Eigen::Matrix3d C_vel = fallback_velocity_var * Eigen::Matrix3d::Identity();
-  const auto state = make_body_state(T, v, w, nullptr, &C_vel, twist_angular_cov, *T_imu_child);
+  // Covariances of the last optimized state (GLIM's or the fallbacks), moved to the propagated pose.
+  // Not grown by the propagation: the error the strapdown adds between scans is not modelled.
+  const gtsam::Matrix6 C_pose = cov_after(latest_state->pose_cov, latest_state->T_odom_imu.inverse() * T);
+  const auto state = make_body_state(T, v, w, &C_pose, &latest_state->vel_cov, twist_angular_cov, *T_imu_child);
   odometry_imu_rate_pub->publish(to_odom_msg(state, from_sec(t), odom_frame_id, child_frame_id));
 }
 

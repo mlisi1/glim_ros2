@@ -172,7 +172,7 @@ Publishing is lazy: a message is only built when the topic has subscribers.
 |---|---|---|---|
 | `odometry/local` | `nav_msgs/Odometry` | `odom` → child | Optimized odometry (no loop closure); twist in child frame |
 | `odometry/global` | `nav_msgs/Odometry` | `map` → child | Same with loop closure applied |
-| `odometry/imu_rate` | `nav_msgs/Odometry` | `odom` → child | Latest optimized state propagated with every new IMU sample (bias-corrected strapdown); low latency, but inherits GLIM's velocity error between scans |
+| `odometry/imu_rate` | `nav_msgs/Odometry` | `odom` → child | Latest optimized state propagated with every new IMU sample (bias-corrected strapdown); low latency, but inherits GLIM's velocity error between scans. Covariance: the last optimized state's, not grown by the propagation |
 | `odom`, `odom_corrected` | `nav_msgs/Odometry` | `odom` → child | Prediction / optimized (upstream names) |
 | `odom_scanend`, `odom_scanend_corrected` | `nav_msgs/Odometry` | `odom` → child | Pose at the end of the scan (needs `save_imu_rate_trajectory`) |
 | `lidar_odom*` | `nav_msgs/Odometry` | `odom` → lidar | As above, always in the LiDAR frame |
@@ -190,7 +190,9 @@ Service: `save_map` (`std_srvs/Trigger`) — response `message` is the output di
 Diagnostics: `/diagnostics`, status `GLIM` — IMU / point cloud / odometry rates, rejected clouds,
 odometry workload; WARN when inputs stop or odometry falls behind, ERROR when clouds arrive but no
 odometry is produced. Covariances in `odom*`, `pose*_with_cov` and `odometry/*` are expressed about
-the axes of the header frame (rotated from GTSAM's body frame).
+the axes of the header frame (rotated from GTSAM's body frame). No output reports an all-zero pose covariance: the
+scan-end outputs carry the frame's covariance moved to the scan end, `odometry/imu_rate` the last
+optimized one.
 
 Saving at shutdown happens after Ctrl-C and can take a few seconds on large maps; increase the launch
 `sigterm_timeout` (default 5 s) or call `save_map` before stopping.
