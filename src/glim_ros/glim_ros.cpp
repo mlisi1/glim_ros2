@@ -3,6 +3,8 @@
 #define GLIM_ROS2
 
 #include <deque>
+#include <filesystem>
+#include <system_error>
 #include <ctime>
 #include <iomanip>
 #include <sstream>
@@ -277,13 +279,29 @@ GlimROS::GlimROS(const rclcpp::NodeOptions& options) : Node("glim_ros", options)
       oss << map_save_directory << "/" << std::put_time(std::localtime(&t), "%Y%m%d_%H%M%S");
       const std::string path = oss.str();
 
+      // Create the folder here, so an unwritable map_save_directory is a failed call, not an exception in the save thread
+      std::error_code ec;
+      std::filesystem::create_directories(path, ec);
+      if (ec) {
+        spdlog::error("cannot save the map: cannot create {}: {}", path, ec.message());
+        res->success = false;
+        res->message = "cannot create " + path + ": " + ec.message();
+        saving = false;
+        return;
+      }
+
       // Saving optimizes and serializes the whole graph: never do it in the executor thread (it would stall sensor callbacks)
       if (save_thread.joinable()) {
         save_thread.join();
       }
       save_thread = std::thread([this, path] {
-        save(path);
-        spdlog::info("map saved to {}", path);
+        // An exception escaping this thread would terminate GLIM, and the map with it
+        try {
+          save(path);
+          spdlog::info("map saved to {}", path);
+        } catch (const std::exception& e) {
+          spdlog::error("saving the map to {} failed: {}", path, e.what());
+        }
         saving = false;
       });
 
@@ -314,7 +332,11 @@ GlimROS::~GlimROS() {
   if (dump_on_unload) {
     const std::string dump_path = this->get_parameter("dump_path").as_string();
     wait(true);
-    save(dump_path);
+    try {
+      save(dump_path);
+    } catch (const std::exception& e) {
+      spdlog::error("saving the shutdown dump to {} failed: {}", dump_path, e.what());
+    }
   }
 
   extension_modules.clear();
