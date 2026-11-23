@@ -1,3 +1,4 @@
+#include <csignal>
 #include <iostream>
 #include <spdlog/spdlog.h>
 #include <rclcpp/rclcpp.hpp>
@@ -16,6 +17,10 @@ int main(int argc, char** argv) {
   exec.add_node(glim);
   exec.spin();
   rclcpp::shutdown();
+  // rclcpp::shutdown() removes rclcpp's SIGINT handler. Ctrl-C in a terminal reaches GLIM twice (the
+  // terminal's process group and ros2 launch), and the second SIGINT would kill it while it saves
+  // the dump below. Ignore further SIGINTs: SIGTERM (launch's sigterm_timeout) still stops it.
+  std::signal(SIGINT, SIG_IGN);
 
   const std::string dump_path = glim->get_parameter("dump_path").as_string();
 
